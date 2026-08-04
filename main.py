@@ -225,15 +225,103 @@ class SearchOptimizerPlugin(Star):
         return count
 
     # ══════════════════════════════════════════════════════════
-    # 钩子：优化网络搜索（缓存命中时跳过搜索）
+    # 钩子：on_llm_request（每次 LLM 调用前触发，最可靠）
     # ══════════════════════════════════════════════════════════
 
     @filter.on_llm_request()
     async def on_llm_request(
         self, event: AstrMessageEvent, req: ProviderRequest
     ):
-        if not self.optimize_search:
+        # ── 1. 预处理：扫描上下文中的搜索结果 ──
+        await self._preprocess_context(req)
+
+        # ── 2. 缓存优化：命中缓存时注入结果 ──
+        if self.optimize_search:
+            await self._inject_cache(req)
+
+    async def _preprocess_context(self, req: ProviderRequest):
+        """扫描会话上下文，预处理未压缩的搜索结果。"""
+        # 尝试多种属性名获取对话上下文
+        contexts = None
+        for attr in ("contexts", "messages", "conversation_context"):
+            contexts = getattr(req, attr, None)
+            if contexts and isinstance(contexts, list):
+                break
+        if not contexts:
             return
+
+        for msg in contexts:
+            # 只处理工具返回消息
+            role = getattr(msg, "role", None)
+            if role not in ("tool", "function"):
+                continue
+
+            # 获取工具名
+            tool_name = getattr(msg, "name", "") or ""
+
+            # 获取文本内容
+            content = getattr(msg, "content", None)
+            text = self._extract_text(content)
+            if not text or len(text) < 2000:
+                continue
+
+            # 检查是否为搜索内容（按工具名或内容特征）
+            is_search = (
+                _is_search_tool(tool_name)
+                or _is_json_search_result(text)
+                or self._has_many_urls(text)
+            )
+            if not is_search:
+                continue
+
+            # 防重复处理：检查是否已经被压缩过
+            if "<compressed>" in text or "<cached_answer>" in text:
+                continue
+
+            original_len = len(text)
+            logger.info(
+                f"[搜索优化器] 上下文拦截 {tool_name} ({original_len} 字符)"
+            )
+
+            source_urls = self._extract_urls(text)
+            cleaned = self._strip_noise(text)
+            if not cleaned:
+                continue
+
+            if self.preprocess_provider_id:
+                summary = await self._llm_preprocess(
+                    tool_name, {}, cleaned, source_urls
+                )
+            else:
+                summary = self._rule_extract(
+                    tool_name, {}, cleaned, source_urls
+                )
+
+            if summary and len(summary) < original_len:
+                # 标记已压缩，防止重复处理
+                summary = f"<compressed>\n{summary}"
+                self._replace_content(msg, content, summary)
+                saved = original_len - len(summary)
+                self._total_chars_saved += saved
+                self._preprocess_count += 1
+                mode = "LLM" if self.preprocess_provider_id else "规则"
+                logger.info(
+                    f"[搜索优化器] [{mode}] {original_len}→{len(summary)} "
+                    f"(省 {saved}，累计 {self._total_chars_saved})"
+                )
+
+                if self.optimize_search:
+                    cache_key = self._extract_search_query({})
+                    if cache_key:
+                        self._cache_set(cache_key, summary)
+
+    def _has_many_urls(self, text: str, min_count: int = 3) -> bool:
+        """判断文本是否包含大量 URL。"""
+        urls = re.findall(r'https?://[^\s<>\]\)\"\']+', text)
+        return len(set(urls)) >= min_count
+
+    async def _inject_cache(self, req: ProviderRequest):
+        """缓存命中时注入预处理结果。"""
         user_msg = self._get_user_message(req)
         if not user_msg or len(user_msg) < 5:
             return
@@ -663,17 +751,45 @@ class SearchOptimizerPlugin(Star):
             ) or self.preprocess_provider_id
 
         cache_count = len(self._cache)
+
+        # 计算压缩率
+        ratio = "-"
+        if self._preprocess_count > 0 and self._total_chars_saved > 0:
+            # 估算平均压缩率
+            avg_saved = self._total_chars_saved / self._preprocess_count
+            ratio = f"~{avg_saved / (avg_saved + self.max_summary_chars) * 100:.0f}%"
+
+        # 估算节省 Token（中文约 1.5 字符 = 1 Token）
+        tokens_saved = self._total_chars_saved // 1.5 if self._total_chars_saved > 0 else 0
+
+        # 缓存命中率
+        total_queries = self._cache_hits + self._preprocess_count
+        hit_rate = f"{self._cache_hits / total_queries * 100:.0f}%" if total_queries > 0 else "-"
+
+        # 模式描述
+        if self.small_model_answer and self.preprocess_provider_id:
+            mode_desc = "小模型直接回答"
+        elif self.preprocess_provider_id:
+            mode_desc = "LLM 摘要压缩"
+        else:
+            mode_desc = "规则提取（零 LLM）"
+
         lines = [
             "📊 搜索结果优化器",
-            f"  模式: {'LLM 摘要' if self.preprocess_provider_id else '规则提取'}",
-            f"  模型: {model}",
-            f"  优化搜索: {'✅' if self.optimize_search else '❌'}",
-            f"  小模型回答: {'✅' if self.small_model_answer else '❌'}",
-            f"  缓存: {cache_count}/{self.max_cache_entries} 条 ({self.cache_days}天)",
-            f"  摘要上限: {self.max_summary_chars} 字符",
-            f"  缓存命中: {self._cache_hits} 次",
-            f"  累计处理: {self._preprocess_count} 次",
-            f"  累计节省: {self._total_chars_saved} 字符",
+            "─" * 24,
+            f"模式: {mode_desc}",
+            f"模型: {model}",
+            f"摘要上限: {self.max_summary_chars} 字符",
+            "─" * 24,
+            f"优化搜索: {'✅' if self.optimize_search else '❌'}",
+            f"小模型回答: {'✅' if self.small_model_answer else '❌'}",
+            f"缓存: {cache_count}/{self.max_cache_entries} 条（{self.cache_days} 天过期）",
+            "─" * 24,
+            f"累计处理: {self._preprocess_count} 次",
+            f"缓存命中: {self._cache_hits} 次（命中率 {hit_rate}）",
+            f"压缩率: {ratio}",
+            f"节省字符: {self._total_chars_saved:,}",
+            f"节省 Token: ~{int(tokens_saved):,}",
         ]
         yield event.plain_result("\n".join(lines))
 
