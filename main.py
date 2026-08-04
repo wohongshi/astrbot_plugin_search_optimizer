@@ -502,15 +502,10 @@ class SearchOptimizerPlugin(Star):
         self._total_chars_saved = 0
         self._preprocess_count = 0
         self._cache_hits = 0
-        self._cache_dirty = False
 
-        # 缓存
-        self._cache_dir = str(Path(get_astrbot_data_path()) / "plugin_data" / "search_optimizer")
-        os.makedirs(self._cache_dir, exist_ok=True)
-        self._cache_file = os.path.join(self._cache_dir, "cache.json")
-        self._cache: dict = self._load_cache()
-        self._clean_expired_cache()
-        self._evict_lru()
+        # 内存缓存
+        self._cache: dict = {}
+        self._cache_loaded = False
 
         # 设置浏览器选择
         global _BROWSER_CHOICE
@@ -590,7 +585,7 @@ class SearchOptimizerPlugin(Star):
             if self.optimize_search:
                 cache_key = self._extract_query_from_args(args)
                 if cache_key:
-                    self._cache_set(cache_key, summary)
+                    await self._cache_set(cache_key, summary)
             return summary
 
         return raw_content
@@ -606,87 +601,77 @@ class SearchOptimizerPlugin(Star):
         return ""
 
     # ══════════════════════════════════════════════════════════
-    # 缓存系统
+    # 缓存系统（AstrBot KV 存储）
     # ══════════════════════════════════════════════════════════
 
-    def _load_cache(self) -> dict:
-        try:
-            if os.path.exists(self._cache_file):
-                with open(self._cache_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-        except Exception:
-            pass
-        return {}
-
-    def _save_cache(self, force=False):
-        if not force and not self._cache_dirty:
+    async def _ensure_cache_loaded(self):
+        if self._cache_loaded:
             return
         try:
-            with open(self._cache_file, "w", encoding="utf-8") as f:
-                json.dump(self._cache, f, ensure_ascii=False, indent=2)
-            self._cache_dirty = False
-        except Exception:
-            pass
+            data = await self.get_kv_data("cache", None)
+            if data and isinstance(data, dict):
+                self._cache = data
+                logger.info(f"[搜索优化器] 从存储加载 {len(self._cache)} 条缓存")
+        except Exception as e:
+            logger.warning(f"[搜索优化器] 加载缓存失败: {e}")
+        self._cache_loaded = True
 
-    def _clean_expired_cache(self):
-        now = time.time()
-        max_age = self.cache_days * 86400
-        expired = [k for k, v in self._cache.items() if now - v.get("ts", 0) > max_age]
-        for k in expired:
-            del self._cache[k]
-        if expired:
-            self._cache_dirty = True
-            self._save_cache()
+    async def _persist_cache(self):
+        try:
+            now = time.time()
+            max_age = self.cache_days * 86400
+            # 清理过期
+            expired = [k for k, v in self._cache.items() if now - v.get("ts", 0) > max_age]
+            for k in expired:
+                del self._cache[k]
+            # LRU 淘汰
+            if len(self._cache) > self.max_cache_entries:
+                sorted_keys = sorted(
+                    self._cache.keys(),
+                    key=lambda k: (self._cache[k].get("hits", 0), self._cache[k].get("ts", 0)),
+                )
+                for k in sorted_keys[: len(self._cache) - self.max_cache_entries]:
+                    del self._cache[k]
+            await self.put_kv_data("cache", self._cache)
+        except Exception as e:
+            logger.warning(f"[搜索优化器] 保存缓存失败: {e}")
 
-    def _evict_lru(self):
-        if len(self._cache) <= self.max_cache_entries:
-            return
-        sorted_keys = sorted(
-            self._cache.keys(),
-            key=lambda k: (self._cache[k].get("hits", 0), self._cache[k].get("ts", 0)),
-        )
-        to_remove = len(self._cache) - self.max_cache_entries
-        for k in sorted_keys[:to_remove]:
-            del self._cache[k]
-        if to_remove > 0:
-            self._cache_dirty = True
-
-    def _cache_get(self, query: str) -> Optional[str]:
+    async def _cache_get(self, query: str) -> Optional[str]:
+        await self._ensure_cache_loaded()
         key = _normalize_query(query)
         entry = self._cache.get(key)
         if not entry:
             q_words = set(key.split())
-            for cached_key, cached_entry in self._cache.items():
-                c_words = set(cached_key.split())
-                if not q_words or not c_words:
-                    continue
-                if len(q_words & c_words) / min(len(q_words), len(c_words)) > 0.6:
-                    entry = cached_entry
-                    key = cached_key
+            for ck, ce in self._cache.items():
+                cw = set(ck.split())
+                if q_words and cw and len(q_words & cw) / min(len(q_words), len(cw)) > 0.6:
+                    entry = ce
                     break
         if not entry:
             return None
-        max_age = self.cache_days * 86400
-        if time.time() - entry.get("ts", 0) > max_age:
+        if time.time() - entry.get("ts", 0) > self.cache_days * 86400:
             del self._cache[key]
             return None
         entry["hits"] = entry.get("hits", 0) + 1
-        self._cache_dirty = True
         return entry.get("content", "")
 
-    def _cache_set(self, query: str, content: str):
+    async def _cache_set(self, query: str, content: str):
+        await self._ensure_cache_loaded()
         key = _normalize_query(query)
         if not key:
             return
         self._cache[key] = {"content": content, "ts": time.time(), "hits": 0, "chars": len(content)}
-        self._cache_dirty = True
-        self._evict_lru()
+        logger.info(f"[搜索优化器] 缓存写入: '{key}' ({len(content)} 字符), 总条数={len(self._cache)}")
+        await self._persist_cache()
 
-    def _cache_clear(self):
+    async def _cache_clear(self):
+        await self._ensure_cache_loaded()
         count = len(self._cache)
         self._cache.clear()
-        self._cache_dirty = True
-        self._save_cache(force=True)
+        try:
+            await self.delete_kv_data("cache")
+        except Exception:
+            pass
         return count
 
     # ══════════════════════════════════════════════════════════
@@ -700,7 +685,7 @@ class SearchOptimizerPlugin(Star):
         user_msg = self._get_user_message(req)
         if not user_msg or len(user_msg) < 5:
             return
-        cached = self._cache_get(user_msg)
+        cached = await self._cache_get(user_msg)
         if not cached:
             return
         self._cache_hits += 1
@@ -1119,7 +1104,7 @@ class SearchOptimizerPlugin(Star):
 
     @filter.command("清除缓存")
     async def cmd_clear_cache(self, event: AstrMessageEvent):
-        count = self._cache_clear()
+        count = await self._cache_clear()
         yield event.plain_result(f"✅ 已清除 {count} 条缓存")
 
     # ══════════════════════════════════════════════════════════
@@ -1159,7 +1144,7 @@ class SearchOptimizerPlugin(Star):
     # ══════════════════════════════════════════════════════════
 
     async def terminate(self):
-        self._save_cache(force=True)
+        await self._persist_cache()
         if self._preprocess_count > 0 or self._cache_hits > 0:
             logger.info(
                 f"[搜索优化器] 停止: 处理 {self._preprocess_count} 次，"
