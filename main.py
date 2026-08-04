@@ -858,6 +858,11 @@ class SearchOptimizerPlugin(Star):
 
     async def terminate(self):
         self._save_cache(force=True)
+        # 关闭共享 HTTP 连接池
+        from .tools.bing_search import close_session as close_bing
+        from .tools.web_fetch import close_session as close_fetch
+        await close_bing()
+        await close_fetch()
         if self._preprocess_count > 0 or self._cache_hits > 0:
             logger.info(
                 f"[搜索优化器] 停止: 处理 {self._preprocess_count} 次，"

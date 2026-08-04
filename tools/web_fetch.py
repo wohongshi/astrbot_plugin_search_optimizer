@@ -1,10 +1,9 @@
-"""网页抓取工具 — 异步 aiohttp + trafilatura 实现，无需浏览器"""
+"""网页抓取工具 — 异步 aiohttp + trafilatura 实现，带连接复用"""
 
 import asyncio
 import ipaddress
 import re
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 import aiohttp
@@ -23,6 +22,28 @@ _USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
 )
+
+# ── 共享 Session ──
+_session: aiohttp.ClientSession | None = None
+_session_lock = asyncio.Lock()
+
+
+async def _get_session() -> aiohttp.ClientSession:
+    global _session
+    async with _session_lock:
+        if _session is None or _session.closed:
+            timeout = aiohttp.ClientTimeout(total=30, connect=10)
+            _session = aiohttp.ClientSession(timeout=timeout)
+        return _session
+
+
+async def close_session():
+    """插件卸载时调用，关闭连接池。"""
+    global _session
+    async with _session_lock:
+        if _session and not _session.closed:
+            await _session.close()
+        _session = None
 
 
 def validate_url(url: str) -> str | None:
@@ -49,7 +70,7 @@ def validate_url(url: str) -> str | None:
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified:
             return f"错误：不允许访问内网/私有地址 '{host}'"
     except ValueError:
-        pass  # 域名，跳过 IP 检查
+        pass
 
     return None
 
@@ -68,7 +89,6 @@ async def fetch_page_async(
         "User-Agent": _USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate",
     }
 
     max_retries = 3
@@ -76,19 +96,19 @@ async def fetch_page_async(
 
     for attempt in range(max_retries):
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url, headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=timeout),
-                    allow_redirects=True,
-                ) as resp:
-                    if resp.status != 200:
-                        last_error = f"HTTP {resp.status}: {resp.reason}"
-                        await asyncio.sleep(1)
-                        continue
-                    html = await resp.text(errors="replace")
+            session = await _get_session()
+            async with session.get(
+                url, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+                allow_redirects=True,
+            ) as resp:
+                if resp.status != 200:
+                    last_error = f"HTTP {resp.status}: {resp.reason}"
+                    await asyncio.sleep(1)
+                    continue
+                html = await resp.text(errors="replace")
 
-            # 用 trafilatura 提取正文
+            # trafilatura 提取正文
             extracted = trafilatura.extract(
                 html,
                 include_comments=False,
@@ -99,13 +119,12 @@ async def fetch_page_async(
             if extracted:
                 text = extracted.strip()
             else:
-                # fallback: 从 HTML 中粗提取
                 text = _fallback_extract(html)
 
             if not text:
                 text = "页面内容为空"
 
-            # 提取标题
+            # 标题
             title = ""
             title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
             if title_match:
@@ -114,7 +133,6 @@ async def fetch_page_async(
             if title:
                 text = f"标题: {title}\n\n{text}"
 
-            # 截断
             if max_chars > 0 and len(text) > max_chars:
                 text = text[:max_chars] + "\n\n[内容已截断，全文超过字符限制]"
 
@@ -131,15 +149,13 @@ async def fetch_page_async(
 
 
 def _fallback_extract(html: str) -> str:
-    """从 HTML 粗提取文本（trafilatura 失败时的降级方案）。"""
+    """trafilatura 失败时的降级提取。"""
     try:
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, "html.parser")
-        # 移除 script/style
-        for tag in soup(["script", "style", "nav", "header", "footer"]):
+        for tag in soup(["script", "style", "nav", "header", "footer", "aside"]):
             tag.decompose()
         text = soup.get_text(separator="\n", strip=True)
-        # 清理多余空行
         text = re.sub(r"\n\s*\n", "\n\n", text)
         return text.strip()
     except Exception:
@@ -151,7 +167,7 @@ if _ASTRBOT_AVAILABLE:
     @dataclass
     class WebFetchTool(FunctionTool):
         name: str = "web_fetch"
-        description: str = "抓取指定 URL 的网页内容并返回文本。urls 传 URL 列表。"
+        description: str = "抓取指定 URL 的网页内容并返回文本。urls 传 URL 列表，支持并行抓取。"
         parameters: dict = field(
             default_factory=lambda: {
                 "type": "object",
@@ -174,7 +190,6 @@ if _ASTRBOT_AVAILABLE:
                     content=[TextContent(type="text", text="未提供 URL")]
                 )
 
-            # 并行抓取
             tasks = [
                 fetch_page_async(url, timeout=self.fetch_timeout)
                 for url in urls
