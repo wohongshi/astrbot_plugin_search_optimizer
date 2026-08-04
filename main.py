@@ -332,7 +332,7 @@ class SearchOptimizerPlugin(Star):
             f"[搜索优化器] 缓存命中 (累计 {self._cache_hits}): {user_msg[:30]}..."
         )
 
-        # 如果开启小模型直接回答，用预处理模型生成最终答案
+        # 注入时明确告诉 LLM 不要再搜索
         if self.small_model_answer and self.preprocess_provider_id:
             answer = await self._small_model_answer(user_msg, cached)
             if answer:
@@ -340,7 +340,8 @@ class SearchOptimizerPlugin(Star):
                     from astrbot.core.agent.message import TextPart
                     inject_text = (
                         f"<cached_answer>\n"
-                        f"以下是根据搜索结果生成的回答，直接输出即可：\n\n"
+                        f"以下是根据之前搜索结果生成的回答，直接输出即可。"
+                        f"已有足够信息，无需调用 web_search 或 web_fetch。\n\n"
                         f"{answer}\n"
                         f"</cached_answer>"
                     )
@@ -348,20 +349,19 @@ class SearchOptimizerPlugin(Star):
                         req.extra_user_content_parts.append(
                             TextPart(text=inject_text).mark_as_temp()
                         )
-                    logger.info(
-                        f"[搜索优化器] 小模型已生成答案 ({len(answer)} 字符)"
-                    )
+                    logger.info(f"[搜索优化器] 小模型已生成答案 ({len(answer)} 字符)")
                 except Exception as e:
                     logger.warning(f"[搜索优化器] 注入答案失败: {e}")
             return
 
-        # 普通模式：注入缓存内容，让主力模型组织答案
+        # 普通模式：注入缓存 + 告诉 LLM 不要重复搜索
         try:
             from astrbot.core.agent.message import TextPart
             inject_text = (
                 f"<cached_search_results>\n"
-                f"以下是之前搜索「{user_msg[:50]}」的预处理结果，"
-                f"可直接用于回答，无需再次搜索：\n\n{cached}\n"
+                f"以下是之前搜索「{user_msg[:50]}」的预处理结果。"
+                f"已有足够信息回答此问题，无需调用 web_search 或 web_fetch。"
+                f"请直接基于以下内容回答：\n\n{cached}\n"
                 f"</cached_search_results>"
             )
             if hasattr(req, "extra_user_content_parts"):
@@ -705,6 +705,30 @@ class SearchOptimizerPlugin(Star):
             r'(?:ICP备|备案号|公安备).*?\n',
         ]:
             text = re.sub(p, '', text, flags=re.IGNORECASE)
+
+        # ── Wiki/Fandom 内容优化 ──
+        # 去除 wiki 标记和模板噪音
+        wiki_noise = [
+            r'\{\{[^}]*\}\}',             # {{模板}}
+            r'\[\[Category:[^\]]*\]\]',    # [[Category:...]]
+            r'\[\[File:[^\]]*\]\]',        # [[File:...]]
+            r'\[\[Image:[^\]]*\]\]',       # [[Image:...]]
+            r'<ref[^>]*>.*?</ref>',           # <ref>引用</ref>
+            r'<ref[^>]*/>',                   # <ref ... />
+            r'</?nowiki>',                    # <nowiki> 标记
+            r'\{\|[^|]*\|}',               # 表格标记
+            r'^\s*\|.*$',                    # 表格行
+            r'^\s*!\s.*$',                   # 表格标题行
+            r'↑.*?引用.*?$',                  # 引用标记行
+        ]
+        for pat in wiki_noise:
+            text = re.sub(pat, '', text, flags=re.IGNORECASE | re.MULTILINE)
+
+        # 简化 wiki 链接：[[显示文本|链接文本]] → 显示文本
+        text = re.sub(r'\[\[([^|\]]*?)\]\]', r'\1', text)
+        text = re.sub(r'\[\[[^|]*?\|([^\]]*?)\]\]', r'\1', text)
+
+        # 去除短行（通常是导航、菜单、按钮文字）
         lines = text.split('\n')
         filtered = []
         for line in lines:
@@ -713,6 +737,7 @@ class SearchOptimizerPlugin(Star):
                 filtered.append('')
             elif len(s) > 15 or any(c in s for c in '。，、；：！？'):
                 filtered.append(line)
+
         return '\n'.join(filtered).strip()
 
     def _smart_truncate(self, text, max_chars):
