@@ -639,8 +639,24 @@ class SearchOptimizerPlugin(Star):
         except Exception as e:
             logger.warning(f"[搜索优化器] 注入失败: {e}")
 
+    # 中文停用词（2字bigram过滤）
+    _STOP_BIGRAMS = set('的了是在我你他她它们这那有不也和与或但如果因为所以可以就要想要更多关于什么怎么怎样一下帮我搜')
+
+    def _extract_keywords(self, text: str) -> set:
+        """提取关键词（中文2字bigram + 英文单词）。"""
+        text = re.sub(r'[^\w\u4e00-\u9fff]', '', text.lower())
+        words = set()
+        words.update(re.findall(r'[a-z]{2,}', text))
+        cn = re.findall(r'[\u4e00-\u9fff]+', text)
+        for seg in cn:
+            for i in range(len(seg) - 1):
+                w = seg[i:i+2]
+                if w not in self._STOP_BIGRAMS:
+                    words.add(w)
+        return words
+
     def _find_cached_from_context(self, req: ProviderRequest, user_msg: str) -> Optional[str]:
-        """从对话上下文中查找之前的搜索结果。"""
+        """从对话上下文中查找与当前问题相关的搜索结果。"""
         contexts = None
         for attr in ('contexts', 'messages', 'conversation_context'):
             contexts = getattr(req, attr, None)
@@ -649,7 +665,12 @@ class SearchOptimizerPlugin(Star):
         if not contexts:
             return None
 
-        # 从后往前找最近的工具返回消息
+        # 提取当前用户消息的关键词
+        msg_words = self._extract_keywords(user_msg)
+        if not msg_words:
+            return None
+
+        # 从后往前找最近的相关工具返回
         for msg in reversed(contexts):
             role = getattr(msg, 'role', None)
             if role not in ('tool', 'function'):
@@ -658,10 +679,18 @@ class SearchOptimizerPlugin(Star):
             text = self._extract_text(content)
             if not text or len(text) < 200:
                 continue
-            if '<compressed>' in text or _is_json_search_result(text) or len(text) > 500:
-                clean = text.replace('<compressed>\n', '').replace('<compressed>', '')
-                if clean:
-                    return clean
+            if '<compressed>' not in text and not _is_json_search_result(text) and len(text) <= 500:
+                continue
+
+            # 相关性检查：至少1个关键词出现在搜索结果中
+            text_lower = text.lower()
+            matched = sum(1 for w in msg_words if w in text_lower)
+            if matched < 1:
+                continue
+
+            clean = text.replace('<compressed>\n', '').replace('<compressed>', '')
+            if clean:
+                return clean
         return None
 
     def _get_user_message(self, req: ProviderRequest) -> str:
