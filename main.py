@@ -27,6 +27,7 @@ _SEARCH_TOOL_PATTERNS = (
     "web_search", "web_fetch", "web_search_tool", "web_fetch_tool",
     "bing_search", "google_search",
     "tavily", "brave_search", "duckduckgo",
+    "astrbot_execute_shell",  # AstrBot 内置电脑能力（网页搜索等）
 )
 
 
@@ -225,95 +226,93 @@ class SearchOptimizerPlugin(Star):
         return count
 
     # ══════════════════════════════════════════════════════════
-    # 钩子：on_llm_request（每次 LLM 调用前触发，最可靠）
+    # 钩子：on_agent_done（agent 运行完成后触发，扫描工具结果）
+    # ══════════════════════════════════════════════════════════
+
+    @filter.on_agent_done()
+    async def on_agent_done(self, event, run_context, resp):
+        """agent 运行完成后，扫描对话中的工具结果，预处理并缓存。"""
+        try:
+            # 获取对话历史
+            messages = None
+            ctx = run_context
+            for attr in ('messages', 'conversation_context', 'history', 'contexts'):
+                messages = getattr(ctx, attr, None)
+                if messages and isinstance(messages, list):
+                    break
+            # 尝试从 context 子对象获取
+            if not messages:
+                inner = getattr(ctx, 'context', None)
+                if inner:
+                    for attr in ('messages', 'conversation_context', 'history'):
+                        messages = getattr(inner, attr, None)
+                        if messages and isinstance(messages, list):
+                            break
+            if not messages:
+                return
+
+            for msg in messages:
+                role = getattr(msg, 'role', None)
+                if role not in ('tool', 'function'):
+                    continue
+                tool_name = getattr(msg, 'name', '') or ''
+                content = getattr(msg, 'content', None)
+                text = self._extract_text(content)
+                if not text or len(text) < 2000:
+                    continue
+                if '<compressed>' in text:
+                    continue
+
+                # 判断是否为搜索/抓取内容
+                is_search = (
+                    _is_search_tool(tool_name)
+                    or _is_json_search_result(text)
+                    or self._has_many_urls(text)
+                    or len(text) > 5000
+                )
+                if not is_search:
+                    continue
+
+                logger.info(f"[搜索优化器] 发现搜索内容: {tool_name} ({len(text)} 字符)")
+                source_urls = self._extract_urls(text)
+                cleaned = self._strip_noise(text)
+                if not cleaned:
+                    continue
+
+                if self.preprocess_provider_id:
+                    summary = await self._llm_preprocess(tool_name, {}, cleaned, source_urls)
+                else:
+                    summary = self._rule_extract(tool_name, {}, cleaned, source_urls)
+
+                if summary and len(summary) < len(text):
+                    # 标记已压缩
+                    summary = f"<compressed>\n{summary}"
+                    self._replace_content(msg, content, summary)
+                    saved = len(text) - len(summary)
+                    self._total_chars_saved += saved
+                    self._preprocess_count += 1
+                    mode = 'LLM' if self.preprocess_provider_id else '规则'
+                    logger.info(
+                        f"[搜索优化器] [{mode}] {len(text)}→{len(summary)} "
+                        f"(省 {saved}，累计 {self._total_chars_saved})"
+                    )
+                    # 缓存，供下次命中
+                    if self.optimize_search:
+                        self._cache_set(tool_name, summary)
+
+        except Exception as e:
+            logger.error(f"[搜索优化器] on_agent_done 失败: {e}")
+
+    # ══════════════════════════════════════════════════════════
+    # 钩子：on_llm_request（缓存注入，命中缓存时跳过搜索）
     # ══════════════════════════════════════════════════════════
 
     @filter.on_llm_request()
     async def on_llm_request(
         self, event: AstrMessageEvent, req: ProviderRequest
     ):
-        # ── 1. 预处理：扫描上下文中的搜索结果 ──
-        await self._preprocess_context(req)
-
-        # ── 2. 缓存优化：命中缓存时注入结果 ──
         if self.optimize_search:
             await self._inject_cache(req)
-
-    async def _preprocess_context(self, req: ProviderRequest):
-        """扫描会话上下文，预处理未压缩的搜索结果。"""
-        # 尝试多种属性名获取对话上下文
-        contexts = None
-        for attr in ("contexts", "messages", "conversation_context"):
-            contexts = getattr(req, attr, None)
-            if contexts and isinstance(contexts, list):
-                break
-        if not contexts:
-            return
-
-        for msg in contexts:
-            # 只处理工具返回消息
-            role = getattr(msg, "role", None)
-            if role not in ("tool", "function"):
-                continue
-
-            # 获取工具名
-            tool_name = getattr(msg, "name", "") or ""
-
-            # 获取文本内容
-            content = getattr(msg, "content", None)
-            text = self._extract_text(content)
-            if not text or len(text) < 2000:
-                continue
-
-            # 检查是否为搜索内容（按工具名或内容特征）
-            is_search = (
-                _is_search_tool(tool_name)
-                or _is_json_search_result(text)
-                or self._has_many_urls(text)
-            )
-            if not is_search:
-                continue
-
-            # 防重复处理：检查是否已经被压缩过
-            if "<compressed>" in text or "<cached_answer>" in text:
-                continue
-
-            original_len = len(text)
-            logger.info(
-                f"[搜索优化器] 上下文拦截 {tool_name} ({original_len} 字符)"
-            )
-
-            source_urls = self._extract_urls(text)
-            cleaned = self._strip_noise(text)
-            if not cleaned:
-                continue
-
-            if self.preprocess_provider_id:
-                summary = await self._llm_preprocess(
-                    tool_name, {}, cleaned, source_urls
-                )
-            else:
-                summary = self._rule_extract(
-                    tool_name, {}, cleaned, source_urls
-                )
-
-            if summary and len(summary) < original_len:
-                # 标记已压缩，防止重复处理
-                summary = f"<compressed>\n{summary}"
-                self._replace_content(msg, content, summary)
-                saved = original_len - len(summary)
-                self._total_chars_saved += saved
-                self._preprocess_count += 1
-                mode = "LLM" if self.preprocess_provider_id else "规则"
-                logger.info(
-                    f"[搜索优化器] [{mode}] {original_len}→{len(summary)} "
-                    f"(省 {saved}，累计 {self._total_chars_saved})"
-                )
-
-                if self.optimize_search:
-                    cache_key = self._extract_search_query({})
-                    if cache_key:
-                        self._cache_set(cache_key, summary)
 
     def _has_many_urls(self, text: str, min_count: int = 3) -> bool:
         """判断文本是否包含大量 URL。"""
