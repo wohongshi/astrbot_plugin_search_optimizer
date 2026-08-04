@@ -1,8 +1,9 @@
 name: astrbot_plugin_search_optimizer
 display_name: "搜索结果优化器"
-desc: "针对网页搜索插件(web_search/web_fetch)的工具返回结果，用低成本模型预处理摘要，减少主力模型 Token 消耗。"
-version: 5.0.0
-author: "YourName"
-homepage: ""
+desc: "内置网页搜索和抓取工具，压缩搜索结果 + 缓存加速，减少 Token 消耗。"
+short_desc: "网页搜索 + 结果压缩 + 缓存加速，节省 Token"
+version: 6.0.0
+author: "wohongshi"
+homepage: "https://github.com/wohongshi/astrbot_plugin_search_optimizer"
 license: "MIT"
 python_requires: ">=3.10"
