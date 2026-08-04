@@ -92,22 +92,7 @@ def _should_fetch_detail(url: str) -> bool:
 
 
 async def _fetch_detail(url: str, max_chars: int = 3000) -> str:
-    """抓取详情页正文，双引擎：aiohttp + Playwright 兜底。"""
-    # 先用 aiohttp 快速抓取
-    text = await _fetch_detail_aiohttp(url, max_chars)
-    if text and len(text) > 200 and "Loading" not in text[:100]:
-        return text
-
-    # 内容不足，用 Playwright 渲染
-    pw_text = await _fetch_detail_playwright(url, max_chars)
-    if pw_text and len(pw_text) > len(text or ""):
-        return pw_text
-
-    return text or ""
-
-
-async def _fetch_detail_aiohttp(url: str, max_chars: int) -> str:
-    """aiohttp 快速抓取详情。"""
+    """抓取详情页正文。"""
     try:
         import trafilatura
         session = await _get_session()
@@ -136,69 +121,6 @@ async def _fetch_detail_aiohttp(url: str, max_chars: int) -> str:
                 tag.decompose()
             text = soup.get_text(separator="\n", strip=True)
             text = re.sub(r"\n\s*\n", "\n\n", text).strip()
-
-        if max_chars > 0 and len(text) > max_chars:
-            text = text[:max_chars] + "\n...[已截断]"
-        return text
-    except Exception:
-        return ""
-
-
-def _find_system_chromium() -> str | None:
-    """查找系统 Chromium。"""
-    import shutil, os
-    for p in ["/usr/bin/chromium", "/usr/bin/chromium-browser",
-              "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"]:
-        if shutil.which(p) or os.path.isfile(p):
-            return p
-    return None
-
-
-async def _fetch_detail_playwright(url: str, max_chars: int) -> str:
-    """Playwright 无头浏览器渲染抓取详情。"""
-    try:
-        from playwright.async_api import async_playwright
-    except ImportError:
-        return ""
-
-    try:
-        pw = await async_playwright().start()
-        launch_args = {
-            "headless": True,
-            "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-        }
-        chromium_path = _find_system_chromium()
-        if chromium_path:
-            launch_args["executable_path"] = chromium_path
-        browser = await pw.chromium.launch(**launch_args)
-        page = await browser.new_page(
-            user_agent=random.choice(_USER_AGENTS),
-            locale="zh-CN",
-        )
-        await page.goto(url, timeout=15000, wait_until="domcontentloaded")
-        try:
-            await page.wait_for_load_state("networkidle", timeout=8000)
-        except Exception:
-            pass
-        await asyncio.sleep(1)
-
-        text = await page.evaluate("""
-            () => {
-                document.querySelectorAll('script, style, nav, header, footer, aside, iframe').forEach(e => e.remove());
-                return document.body ? document.body.innerText : '';
-            }
-        """)
-
-        await browser.close()
-        await pw.stop()
-
-        if not text or len(text.strip()) < 50:
-            return ""
-
-        text = text.strip()
-        title = await page.title() if not page.is_closed() else ""
-        if title:
-            text = f"标题: {title}\n\n{text}"
 
         if max_chars > 0 and len(text) > max_chars:
             text = text[:max_chars] + "\n...[已截断]"

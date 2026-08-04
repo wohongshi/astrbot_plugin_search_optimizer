@@ -1,8 +1,7 @@
-"""网页抓取工具 — 双引擎：aiohttp 快速抓取 + Playwright 无头浏览器兜底"""
+"""网页抓取工具 — 异步 aiohttp + trafilatura 实现"""
 
 import asyncio
 import ipaddress
-import os
 import re
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
@@ -18,27 +17,15 @@ except ImportError:
     FunctionTool = object
     _ASTRBOT_AVAILABLE = False
 
-# ── Playwright 可用性检测 ──
-_PLAYWRIGHT_AVAILABLE = False
-try:
-    from playwright.async_api import async_playwright
-    _PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    pass
-
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
 )
 
-# ── 共享 aiohttp Session ──
+# ── 共享 Session ──
 _session: aiohttp.ClientSession | None = None
 _session_lock = asyncio.Lock()
-
-# ── Playwright 浏览器实例 ──
-_browser = None
-_browser_lock = asyncio.Lock()
 
 
 async def _get_session() -> aiohttp.ClientSession:
@@ -50,67 +37,12 @@ async def _get_session() -> aiohttp.ClientSession:
         return _session
 
 
-# 系统 Chromium 路径（apt install chromium）
-_SYSTEM_CHROMIUM_PATHS = [
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-    "/usr/bin/google-chrome",
-    "/usr/bin/google-chrome-stable",
-]
-
-
-def _find_system_chromium() -> str | None:
-    """查找系统安装的 Chromium/Chrome。"""
-    import shutil
-    for p in _SYSTEM_CHROMIUM_PATHS:
-        if shutil.which(p) or os.path.isfile(p):
-            return p
-    return None
-
-
-async def _get_browser():
-    """获取共享的 Playwright 浏览器实例（优先用系统 Chromium）。"""
-    global _browser
-    if not _PLAYWRIGHT_AVAILABLE:
-        return None
-    async with _browser_lock:
-        if _browser is None or not _browser.is_connected():
-            try:
-                pw = await async_playwright().start()
-                chromium_path = _find_system_chromium()
-                launch_args = {
-                    "headless": True,
-                    "args": [
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-gpu",
-                        "--disable-extensions",
-                    ],
-                }
-                if chromium_path:
-                    launch_args["executable_path"] = chromium_path
-                    logger.info(f"[web_fetch] 使用系统 Chromium: {chromium_path}")
-                _browser = await pw.chromium.launch(**launch_args)
-            except Exception as e:
-                logger.warning(f"[web_fetch] Playwright 启动失败: {e}")
-                _browser = None
-        return _browser
-
-
 async def close_session():
-    global _session, _browser
+    global _session
     async with _session_lock:
         if _session and not _session.closed:
             await _session.close()
         _session = None
-    if _PLAYWRIGHT_AVAILABLE:
-        async with _browser_lock:
-            if _browser:
-                try:
-                    await _browser.close()
-                except Exception:
-                    pass
-                _browser = None
 
 
 def validate_url(url: str) -> str | None:
@@ -140,37 +72,21 @@ async def fetch_page_async(
     timeout: int = 30,
     max_chars: int = 10000,
 ) -> str:
-    """异步抓取网页。先用 aiohttp 快速抓取，内容不足时自动用 Playwright 渲染。"""
+    """异步抓取网页内容，返回纯文本。"""
     error = validate_url(url)
     if error:
         return error
 
-    # ── 第一步：aiohttp 快速抓取 ──
-    text = await _fetch_aiohttp(url, timeout, max_chars)
-
-    # 判断内容是否足够（JS 渲染页面通常只有很少内容）
-    if text and len(text) > 200 and "Loading" not in text[:100]:
-        return text
-
-    # ── 第二步：Playwright 无头浏览器渲染 ──
-    if _PLAYWRIGHT_AVAILABLE:
-        pw_text = await _fetch_playwright(url, timeout, max_chars)
-        if pw_text and len(pw_text) > len(text or ""):
-            return pw_text
-
-    # 返回 aiohttp 的结果（可能是空的或 Loading）
-    return text or "页面内容为空"
-
-
-async def _fetch_aiohttp(url: str, timeout: int, max_chars: int) -> str:
-    """aiohttp 快速抓取 + trafilatura 提取。"""
     headers = {
         "User-Agent": _USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     }
 
-    for attempt in range(2):
+    max_retries = 3
+    last_error = None
+
+    for attempt in range(max_retries):
         try:
             session = await _get_session()
             async with session.get(
@@ -179,10 +95,9 @@ async def _fetch_aiohttp(url: str, timeout: int, max_chars: int) -> str:
                 allow_redirects=True,
             ) as resp:
                 if resp.status != 200:
-                    if attempt == 0:
-                        await asyncio.sleep(1)
-                        continue
-                    return f"HTTP {resp.status}: {resp.reason}"
+                    last_error = f"HTTP {resp.status}: {resp.reason}"
+                    await asyncio.sleep(1)
+                    continue
                 html = await resp.text(errors="replace")
 
             extracted = trafilatura.extract(
@@ -194,7 +109,7 @@ async def _fetch_aiohttp(url: str, timeout: int, max_chars: int) -> str:
                 text = _fallback_extract(html)
 
             if not text:
-                text = ""
+                text = "页面内容为空"
 
             title = ""
             title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
@@ -204,78 +119,18 @@ async def _fetch_aiohttp(url: str, timeout: int, max_chars: int) -> str:
                 text = f"标题: {title}\n\n{text}"
 
             if max_chars > 0 and len(text) > max_chars:
-                text = text[:max_chars] + "\n\n[内容已截断]"
+                text = text[:max_chars] + "\n\n[内容已截断，全文超过字符限制]"
 
             return text
 
         except asyncio.TimeoutError:
-            if attempt == 0:
-                await asyncio.sleep(1)
-                continue
-            return f"请求超时 ({timeout}s)"
+            last_error = f"请求超时 ({timeout}s)"
+            await asyncio.sleep(1)
         except Exception as e:
-            if attempt == 0:
-                await asyncio.sleep(1)
-                continue
-            return f"{type(e).__name__}: {e}"
+            last_error = f"{type(e).__name__}: {e}"
+            await asyncio.sleep(1)
 
-    return "抓取失败"
-
-
-async def _fetch_playwright(url: str, timeout: int, max_chars: int) -> str:
-    """Playwright 无头浏览器渲染抓取。"""
-    browser = await _get_browser()
-    if not browser:
-        return ""
-
-    page = None
-    try:
-        page = await browser.new_page(
-            user_agent=_USER_AGENT,
-            locale="zh-CN",
-        )
-        await page.goto(url, timeout=timeout * 1000, wait_until="domcontentloaded")
-        # 等待页面渲染
-        try:
-            await page.wait_for_load_state("networkidle", timeout=8000)
-        except Exception:
-            pass
-        # 额外等待动态内容
-        await asyncio.sleep(1)
-
-        # 获取渲染后的文本
-        text = await page.evaluate("""
-            () => {
-                // 移除无关元素
-                document.querySelectorAll('script, style, nav, header, footer, aside, iframe').forEach(e => e.remove());
-                return document.body ? document.body.innerText : '';
-            }
-        """)
-
-        if not text or len(text.strip()) < 50:
-            return ""
-
-        text = text.strip()
-
-        # 获取标题
-        title = await page.title()
-        if title:
-            text = f"标题: {title}\n\n{text}"
-
-        if max_chars > 0 and len(text) > max_chars:
-            text = text[:max_chars] + "\n\n[内容已截断]"
-
-        return text
-
-    except Exception as e:
-        logger.warning(f"[web_fetch] Playwright 抓取失败 ({url}): {e}")
-        return ""
-    finally:
-        if page:
-            try:
-                await page.close()
-            except Exception:
-                pass
+    return f"获取页面失败（重试 {max_retries} 次）: {last_error}"
 
 
 def _fallback_extract(html: str) -> str:
@@ -296,10 +151,7 @@ if _ASTRBOT_AVAILABLE:
     @dataclass
     class WebFetchTool(FunctionTool):
         name: str = "web_fetch"
-        description: str = (
-            "抓取指定 URL 的网页内容并返回文本。"
-            "支持 JS 渲染页面（自动使用无头浏览器）。urls 传 URL 列表。"
-        )
+        description: str = "抓取指定 URL 的网页内容并返回文本。urls 传 URL 列表，支持并行抓取。"
         parameters: dict = field(
             default_factory=lambda: {
                 "type": "object",
@@ -321,17 +173,9 @@ if _ASTRBOT_AVAILABLE:
                 return CallToolResult(
                     content=[TextContent(type="text", text="未提供 URL")]
                 )
-
-            tasks = [
-                fetch_page_async(url, timeout=self.fetch_timeout)
-                for url in urls
-            ]
+            tasks = [fetch_page_async(url, timeout=self.fetch_timeout) for url in urls]
             results = await asyncio.gather(*tasks)
-
-            parts = []
-            for url, text in zip(urls, results):
-                parts.append(f"=== {url} ===\n{text}")
-
+            parts = [f"=== {url} ===\n{text}" for url, text in zip(urls, results)]
             combined = "\n\n".join(parts)
             return CallToolResult(
                 content=[TextContent(type="text", text=combined)]
