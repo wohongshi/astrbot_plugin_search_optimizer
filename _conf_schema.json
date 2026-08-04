@@ -1,0 +1,33 @@
+{
+  "preprocess_provider_id": {
+    "description": "预处理模型（不填则使用规则提取）",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "选择一个低成本模型用于摘要压缩。留空则自动使用规则提取（零 LLM 调用）。"
+  },
+  "optimize_search": {
+    "description": "优化网络搜索（命中缓存时跳过搜索，直接返回预处理结果）",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，若缓存中有相似搜索的预处理结果，直接注入上下文，跳过搜索和抓取。"
+  },
+  "cache_days": {
+    "description": "缓存保留天数",
+    "type": "int",
+    "default": 3,
+    "options": [1, 3, 7]
+  },
+  "max_cache_entries": {
+    "description": "缓存条目上限（LRU 淘汰）",
+    "type": "int",
+    "default": 200,
+    "hint": "缓存超过此数量时，自动删除命中次数最少且最久未用的条目。"
+  },
+  "max_summary_chars": {
+    "description": "预处理后最大字符数",
+    "type": "int",
+    "default": 1500,
+    "hint": "控制摘要长度。值越大保留信息越多，但 Token 消耗也越多。"
+  }
+}

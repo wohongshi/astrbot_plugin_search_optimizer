@@ -1,0 +1,684 @@
+"""
+AstrBot 搜索结果优化器 v5
+功能：
+1. 拦截搜索/抓取工具结果，用低成本模型或规则提取压缩内容
+2. 缓存预处理结果，命中缓存时跳过搜索，直接注入上下文
+3. LRU 缓存淘汰，防止缓存无限增长
+4. 多 URL 并行预处理
+"""
+
+import asyncio
+import json
+import os
+import re
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.provider import ProviderRequest
+from astrbot.api.star import Context, Star
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+# ─── 搜索工具名特征 ────────────────────────────────────────
+_SEARCH_TOOL_PATTERNS = (
+    "web_search", "web_fetch", "web_search_tool", "web_fetch_tool",
+    "bing_search", "google_search",
+    "tavily", "brave_search", "duckduckgo",
+)
+
+
+def _is_search_tool(name: str) -> bool:
+    n = name.lower()
+    return any(p in n for p in _SEARCH_TOOL_PATTERNS)
+
+
+def _is_json_search_result(text: str) -> bool:
+    s = text.strip()
+    if not s.startswith("{"):
+        return False
+    try:
+        d = json.loads(s)
+        if isinstance(d, dict):
+            for k in ("results", "items", "data", "hits", "organic"):
+                if k in d and isinstance(d[k], list):
+                    return True
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return False
+
+
+# 时间敏感词：包含这些词的查询会把当天日期混入缓存 key
+_TIME_KEYWORDS = (
+    "今天", "今日", "今晚", "今晨", "今早",
+    "昨天", "昨日", "昨晚", "前天", "前日", "前晚",
+    "明天", "明日", "后天",
+    "最新", "最近", "近日", "近期", "近来", "晚近",
+    "目前", "当前", "当下", "此刻", "此时", "眼下", "现阶段",
+    "如今", "现今", "现时", "现在",
+    "刚刚", "刚才", "方才",
+    "正在", "即将", "马上", "就要", "快要",
+    "本周", "这周", "上周", "下周",
+    "本月", "上个月", "下个月", "这个月",
+    "今年", "去年", "明年",
+    "这几天", "前段时间", "接下来", "今后", "往后", "此后",
+    "today", "tonight", "yesterday", "tomorrow",
+    "this week", "this month", "this year",
+    "last night", "last week", "last month",
+    "latest", "recent", "recently",
+    "currently", "presently", "just now", "just",
+    "now", "nowadays", "ongoing", "upcoming", "breaking",
+    "right now", "at the moment", "so far",
+)
+
+
+def _normalize_query(text: str) -> str:
+    """归一化搜索关键词，包含时间敏感词时混入当天日期。"""
+    t = text.lower().strip()
+    t = re.sub(r'\s+', ' ', t)
+    t = re.sub(r'[，。、；：！？,.;:!?\-\[\]\(\){}\"\'<>]', '', t)
+    has_time = any(kw in t for kw in _TIME_KEYWORDS)
+    if has_time:
+        today = datetime.now().strftime("%Y%m%d")
+        t = f"{t}__date_{today}"
+    return t
+
+
+class SearchOptimizerPlugin(Star):
+    """搜索结果优化器：压缩搜索结果 + 缓存加速。"""
+
+    def __init__(self, context: Context, config: AstrBotConfig):
+        super().__init__(context)
+        self.config = config
+        self._load_config()
+
+        # 统计
+        self._total_chars_saved = 0
+        self._preprocess_count = 0
+        self._cache_hits = 0
+        self._cache_dirty = False
+
+        # 缓存
+        self._cache_dir = str(
+            Path(get_astrbot_data_path()) / "plugin_data" / "search_optimizer"
+        )
+        os.makedirs(self._cache_dir, exist_ok=True)
+        self._cache_file = os.path.join(self._cache_dir, "cache.json")
+        self._cache: dict = self._load_cache()
+        self._clean_expired_cache()
+        self._evict_lru()
+
+        if not self.preprocess_provider_id:
+            logger.info("[搜索优化器] 未配置预处理模型，使用规则提取模式")
+
+    def _load_config(self):
+        self.preprocess_provider_id = self.config.get("preprocess_provider_id", "")
+        self.optimize_search = self.config.get("optimize_search", False)
+        self.cache_days = self.config.get("cache_days", 3)
+        self.max_cache_entries = self.config.get("max_cache_entries", 200)
+        self.max_summary_chars = self.config.get("max_summary_chars", 1500)
+
+    # ══════════════════════════════════════════════════════════
+    # 缓存系统
+    # ══════════════════════════════════════════════════════════
+
+    def _load_cache(self) -> dict:
+        try:
+            if os.path.exists(self._cache_file):
+                with open(self._cache_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception as e:
+            logger.warning(f"[搜索优化器] 加载缓存失败: {e}")
+        return {}
+
+    def _save_cache(self, force=False):
+        if not force and not self._cache_dirty:
+            return
+        try:
+            with open(self._cache_file, "w", encoding="utf-8") as f:
+                json.dump(self._cache, f, ensure_ascii=False, indent=2)
+            self._cache_dirty = False
+        except Exception as e:
+            logger.warning(f"[搜索优化器] 保存缓存失败: {e}")
+
+    def _clean_expired_cache(self):
+        now = time.time()
+        max_age = self.cache_days * 86400
+        expired = [
+            k for k, v in self._cache.items()
+            if now - v.get("ts", 0) > max_age
+        ]
+        for k in expired:
+            del self._cache[k]
+        if expired:
+            self._cache_dirty = True
+            self._save_cache()
+            logger.info(f"[搜索优化器] 清理 {len(expired)} 条过期缓存")
+
+    def _evict_lru(self):
+        """LRU 淘汰：缓存条数超限时，删除命中次数最少 + 最久未用的条目。"""
+        if len(self._cache) <= self.max_cache_entries:
+            return
+        # 按 (hits, ts) 排序，hits 少 + 时间早的排前面 → 删除
+        sorted_keys = sorted(
+            self._cache.keys(),
+            key=lambda k: (
+                self._cache[k].get("hits", 0),
+                self._cache[k].get("ts", 0),
+            ),
+        )
+        to_remove = len(self._cache) - self.max_cache_entries
+        for k in sorted_keys[:to_remove]:
+            del self._cache[k]
+        if to_remove > 0:
+            self._cache_dirty = True
+            logger.info(f"[搜索优化器] LRU 淘汰 {to_remove} 条缓存")
+
+    def _cache_get(self, query: str) -> Optional[str]:
+        key = _normalize_query(query)
+        entry = self._cache.get(key)
+        if not entry:
+            # 模糊匹配
+            q_words = set(key.split())
+            for cached_key, cached_entry in self._cache.items():
+                c_words = set(cached_key.split())
+                if not q_words or not c_words:
+                    continue
+                overlap = len(q_words & c_words)
+                if overlap / min(len(q_words), len(c_words)) > 0.6:
+                    entry = cached_entry
+                    key = cached_key
+                    break
+        if not entry:
+            return None
+        max_age = self.cache_days * 86400
+        if time.time() - entry.get("ts", 0) > max_age:
+            del self._cache[key]
+            return None
+        entry["hits"] = entry.get("hits", 0) + 1
+        self._cache_dirty = True
+        return entry.get("content", "")
+
+    def _cache_set(self, query: str, content: str):
+        key = _normalize_query(query)
+        if not key:
+            return
+        self._cache[key] = {
+            "content": content,
+            "ts": time.time(),
+            "hits": 0,
+            "chars": len(content),
+        }
+        self._cache_dirty = True
+        # 写入后检查是否需要淘汰
+        self._evict_lru()
+
+    def _cache_clear(self):
+        """清空全部缓存。"""
+        count = len(self._cache)
+        self._cache.clear()
+        self._cache_dirty = True
+        self._save_cache(force=True)
+        return count
+
+    # ══════════════════════════════════════════════════════════
+    # 钩子：优化网络搜索（缓存命中时跳过搜索）
+    # ══════════════════════════════════════════════════════════
+
+    @filter.on_llm_request()
+    async def on_llm_request(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ):
+        if not self.optimize_search:
+            return
+        user_msg = self._get_user_message(req)
+        if not user_msg or len(user_msg) < 5:
+            return
+        cached = self._cache_get(user_msg)
+        if not cached:
+            return
+        self._cache_hits += 1
+        logger.info(
+            f"[搜索优化器] 缓存命中 (累计 {self._cache_hits}): {user_msg[:30]}..."
+        )
+        try:
+            from astrbot.core.agent.message import TextPart
+            inject_text = (
+                f"<cached_search_results>\n"
+                f"以下是之前搜索「{user_msg[:50]}」的预处理结果，"
+                f"可直接用于回答，无需再次搜索：\n\n{cached}\n"
+                f"</cached_search_results>"
+            )
+            if hasattr(req, "extra_user_content_parts"):
+                req.extra_user_content_parts.append(
+                    TextPart(text=inject_text).mark_as_temp()
+                )
+        except Exception as e:
+            logger.warning(f"[搜索优化器] 注入缓存失败: {e}")
+
+    def _get_user_message(self, req: ProviderRequest) -> str:
+        try:
+            if hasattr(req, "contexts") and req.contexts:
+                for msg in reversed(req.contexts):
+                    if hasattr(msg, "role") and msg.role == "user":
+                        content = getattr(msg, "content", None)
+                        if isinstance(content, str):
+                            return content.strip()
+                        if isinstance(content, list):
+                            for item in content:
+                                if hasattr(item, "text"):
+                                    return item.text.strip()
+        except Exception:
+            pass
+        return ""
+
+    # ══════════════════════════════════════════════════════════
+    # 钩子：拦截工具返回结果（支持多 URL 并行处理）
+    # ══════════════════════════════════════════════════════════
+
+    @filter.on_llm_tool_respond()
+    async def on_tool_respond(
+        self, event: AstrMessageEvent, tool,
+        tool_args: dict | None, tool_result,
+    ):
+        tool_name = getattr(tool, "name", "")
+        if not _is_search_tool(tool_name):
+            return
+        try:
+            await self._process_tool_result(
+                event, tool_name, tool_args, tool_result
+            )
+        except Exception as e:
+            logger.error(f"[搜索优化器] 处理 {tool_name} 失败: {e}")
+
+    async def _process_tool_result(
+        self, event, tool_name, tool_args, tool_result
+    ):
+        if not tool_result or not hasattr(tool_result, "content"):
+            return
+
+        # 收集需要处理的 items
+        pending = []
+        for item in tool_result.content:
+            text = getattr(item, "text", None)
+            if text and len(text) >= 2000:
+                pending.append((item, text))
+
+        if not pending:
+            return
+
+        source_urls = self._extract_urls_from_args(tool_args) or (
+            self._extract_urls(pending[0][1]) if pending else []
+        )
+
+        # 并行预处理所有 items
+        async def _process_one(item, text):
+            original_len = len(text)
+            logger.info(f"[搜索优化器] 拦截 {tool_name} ({original_len} 字符)")
+            cleaned = self._strip_noise(text)
+            if not cleaned:
+                return None, None
+            if self.preprocess_provider_id:
+                summary = await self._llm_preprocess(
+                    tool_name, tool_args, cleaned, source_urls
+                )
+            else:
+                summary = self._rule_extract(
+                    tool_name, tool_args, cleaned, source_urls
+                )
+            return item, (original_len, summary)
+
+        # 并行执行
+        results = await asyncio.gather(
+            *[_process_one(item, text) for item, text in pending],
+            return_exceptions=True,
+        )
+
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"[搜索优化器] 并行处理异常: {result}")
+                continue
+            item, data = result
+            if not item or not data:
+                continue
+            original_len, summary = data
+            if summary and len(summary) < original_len:
+                item.text = summary
+                saved = original_len - len(summary)
+                self._total_chars_saved += saved
+                self._preprocess_count += 1
+                mode = "LLM" if self.preprocess_provider_id else "规则"
+                logger.info(
+                    f"[搜索优化器] [{mode}] {original_len}→{len(summary)} "
+                    f"(省 {saved}，累计 {self._total_chars_saved})"
+                )
+                if self.optimize_search:
+                    cache_key = self._extract_search_query(tool_args)
+                    if cache_key:
+                        self._cache_set(cache_key, summary)
+
+    def _extract_search_query(self, tool_args: dict | None) -> str:
+        if not tool_args:
+            return ""
+        for key in ("keywords", "query", "q", "keyword"):
+            val = tool_args.get(key)
+            if val:
+                if isinstance(val, list):
+                    return " ".join(str(v) for v in val)
+                return str(val)
+        return ""
+
+    def _extract_urls_from_args(self, tool_args: dict | None) -> list[str]:
+        if not tool_args:
+            return []
+        urls = tool_args.get("urls", tool_args.get("url", []))
+        if isinstance(urls, str):
+            urls = [urls]
+        if isinstance(urls, list):
+            return [str(u) for u in urls if u]
+        return []
+
+    # ══════════════════════════════════════════════════════════
+    # 统一去噪
+    # ══════════════════════════════════════════════════════════
+
+    def _strip_noise(self, text: str) -> str:
+        if not text:
+            return text
+        text = re.sub(r'https?://[^\s<>\]\)\"\']+', '', text)
+        text = re.sub(r'www\.[^\s<>\]\)\"\']+', '', text)
+        error_pats = [
+            r'^(?:\[[\w\s]*\]\s*|[\w_]+:\s*|\s*)*(?:获取页面失败|访问失败|抓取失败|抓取超时|页面加载超时|连接超时|搜索.*超时|页面内容为空|无法访问|多次重试.*仍未)\s*[,，:：(（].*$',
+            r'^(?:\[[\w\s]*\]\s*|\s*)*(?:获取页面失败|访问失败|抓取失败|抓取超时|页面加载超时|连接超时|搜索.*超时|页面内容为空|无法访问)\s*$',
+            r'^(?:\[[\w\s]*\]\s*|[\w_]+:\s*|\s*)*(?:failed to fetch|fetch failed|connection refused|403 forbidden|404 not found|500 internal|empty page).*$',
+            r'^(?:\[[\w\s]*\]\s*|\s*)*(?:重试|retry|尝试)\s*\d+/\d+.*$',
+        ]
+        for pat in error_pats:
+            text = re.sub(pat, '', text, flags=re.IGNORECASE | re.MULTILINE)
+        text = re.sub(r'\[内容已截断.*?\]', '', text)
+        text = re.sub(r'标题:\s*\n', '', text)
+        text = re.sub(r'===\s*===\s*\n?', '', text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        text = text.strip()
+        return text if len(text) >= 50 else ""
+
+    # ══════════════════════════════════════════════════════════
+    # LLM 预处理
+    # ══════════════════════════════════════════════════════════
+
+    async def _llm_preprocess(
+        self, tool_name, tool_args, content, source_urls
+    ) -> Optional[str]:
+        prompt = self._build_prompt(tool_name, tool_args, content)
+        try:
+            resp = await self.context.llm_generate(
+                chat_provider_id=self.preprocess_provider_id,
+                prompt=prompt,
+            )
+            result = resp.completion_text
+            if not result:
+                return None
+            if source_urls:
+                result += "\n\n来源:\n" + "\n".join(f"- {u}" for u in source_urls[:5])
+            return result
+        except Exception as e:
+            logger.error(f"[搜索优化器] LLM 失败，回退规则: {e}")
+            return self._rule_extract(tool_name, tool_args, content, source_urls)
+
+    def _build_prompt(self, tool_name, tool_args, content):
+        name = tool_name.lower()
+        if "fetch" in name or "browse" in name:
+            p = "从以下网页正文中提取关键信息，去除无关内容，输出精炼摘要。"
+        elif "search" in name:
+            p = "从以下搜索结果中提取关键信息，保留标题和核心内容。"
+        else:
+            p = "从以下内容中提取关键信息，输出精炼摘要。"
+        parts = [p]
+        if tool_args:
+            for k in ("keywords", "query", "urls", "url"):
+                if k in tool_args:
+                    parts.append(f"\n{k}: {tool_args[k]}")
+        parts.append(f"\n--- 原始内容 ---\n{content}")
+        parts.append(f"\n--- 输出摘要（≤{self.max_summary_chars} 字符）---")
+        return "\n".join(parts)
+
+    # ══════════════════════════════════════════════════════════
+    # 规则提取
+    # ══════════════════════════════════════════════════════════
+
+    def _rule_extract(self, tool_name, tool_args, content, source_urls=None):
+        s = content.strip()
+        if re.search(r'===\s*https?://', content):
+            result = self._extract_multi_fetch(content)
+        elif _is_json_search_result(s):
+            result = self._extract_json_search(s)
+        else:
+            result = self._extract_web_text(s)
+        if source_urls and result:
+            result += "\n\n来源:\n" + "\n".join(f"- {u}" for u in source_urls[:5])
+        return result
+
+    def _extract_json_search(self, text):
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return self._extract_web_text(text)
+        results = None
+        for k in ("results", "items", "data", "hits", "organic"):
+            if k in data and isinstance(data[k], list):
+                results = data[k]
+                break
+        if not results:
+            return self._extract_web_text(text)
+        cleaned = []
+        seen_snippets = []
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            title = (item.get("title") or "").strip()
+            url = (item.get("url") or "").strip()
+            snippet = (item.get("snippet") or item.get("description") or "").strip()
+            date = (item.get("date") or "").strip()
+            source = (item.get("source") or "").strip()
+            if not title and not url:
+                continue
+            snippet = self._clean_snippet(snippet, date, source)
+            if snippet and self._is_dup_snippet(snippet, seen_snippets):
+                continue
+            if snippet:
+                seen_snippets.append(snippet)
+            cleaned.append({"title": title, "snippet": snippet, "date": date})
+        if not cleaned:
+            return self._extract_web_text(text)
+        lines = []
+        q = data.get("query", "")
+        if q:
+            lines.append(f"搜索: {q}")
+        for i, item in enumerate(cleaned[:8], 1):
+            line = f"{i}. {item['title']}"
+            if item['date']:
+                line += f" ({item['date']})"
+            if item['snippet']:
+                line += f"\n   {item['snippet']}"
+            lines.append(line)
+        result = "\n".join(lines)
+        if len(result) > self.max_summary_chars:
+            result = result[:self.max_summary_chars] + "\n...[已截断]"
+        return result
+
+    def _clean_snippet(self, snippet, date="", source=""):
+        if not snippet:
+            return ""
+        if date:
+            snippet = re.sub(r'\d{4}[-年/]\d{1,2}[-月/]\d{1,2}[日]?\s*', '', snippet, count=1)
+        if source:
+            snippet = re.sub(rf'\s*[-–—|·•]\s*{re.escape(source)}\s*$', '', snippet)
+        for p in [r'\s*[-–—]\s*$', r'\s*\.\.\.?$', r'\s*[-–—|·]\s*$']:
+            snippet = re.sub(p, '', snippet)
+        for p in [r'^\s*Web\s*', r'^\s*网页\s*', r'^\s*视频\s*']:
+            snippet = re.sub(p, '', snippet, flags=re.IGNORECASE)
+        snippet = re.sub(r'\s+', ' ', snippet).strip()
+        if len(snippet) > 200:
+            t = snippet[:200]
+            lp = max(t.rfind('。'), t.rfind('. '), t.rfind('！'))
+            snippet = t[:lp+1] if lp > 100 else t + "..."
+        return snippet
+
+    def _is_dup_snippet(self, snippet, existing, threshold=0.4):
+        if not existing:
+            return False
+        s1 = snippet[:100]
+        b1 = set(s1[i:i+2] for i in range(len(s1)-1))
+        if not b1:
+            return False
+        for prev in existing:
+            s2 = prev[:100]
+            b2 = set(s2[i:i+2] for i in range(len(s2)-1))
+            if not b2:
+                continue
+            if len(b1 & b2) / len(b1 | b2) > threshold:
+                return True
+        return False
+
+    def _extract_multi_fetch(self, content):
+        sections = re.split(r'===\s*(https?://[^\s=]+)\s*===', content)
+        if len(sections) < 2:
+            return self._extract_web_text(content)
+        parts = []
+        per_page = self.max_summary_chars // max(1, len(sections) // 2)
+        for i in range(1, len(sections), 2):
+            url = sections[i].strip()
+            body = sections[i+1].strip() if i+1 < len(sections) else ""
+            if not body:
+                continue
+            cleaned = self._clean_web_text(body)
+            if len(cleaned) > per_page:
+                cleaned = self._smart_truncate(cleaned, per_page)
+            parts.append(f"=== {url} ===\n{cleaned}")
+        return "\n\n".join(parts)
+
+    def _extract_web_text(self, text):
+        cleaned = self._clean_web_text(text)
+        if len(cleaned) > self.max_summary_chars:
+            cleaned = self._smart_truncate(cleaned, self.max_summary_chars)
+        return cleaned
+
+    def _clean_web_text(self, text):
+        text = re.sub(r'^标题:\s*.*\n+', '', text, count=1)
+        text = re.sub(r'\[内容已截断.*?\]', '', text)
+        for p in [
+            r'(?:Copyright|©|版权).*?\n',
+            r'(?:All Rights Reserved|保留所有权利).*?\n',
+            r'(?:ICP备|备案号|公安备).*?\n',
+        ]:
+            text = re.sub(p, '', text, flags=re.IGNORECASE)
+        lines = text.split('\n')
+        filtered = []
+        for line in lines:
+            s = line.strip()
+            if not s:
+                filtered.append('')
+            elif len(s) > 15 or any(c in s for c in '。，、；：！？'):
+                filtered.append(line)
+        return '\n'.join(filtered).strip()
+
+    def _smart_truncate(self, text, max_chars):
+        if len(text) <= max_chars:
+            return text
+        t = text[:max_chars]
+        for sep in ('\n\n', '。', '. ', '！', '？'):
+            pos = t.rfind(sep)
+            if pos > max_chars * 0.5:
+                return t[:pos + len(sep)] + "\n...[已截断]"
+        return t + "\n...[已截断]"
+
+    def _extract_urls(self, text):
+        urls = re.findall(r'https?://[^\s<>\]\)\"\']+', text)
+        seen = set()
+        out = []
+        for u in urls:
+            u = u.rstrip(".,;:!?。，；：！？")
+            if u not in seen:
+                seen.add(u)
+                out.append(u)
+        return out
+
+    # ══════════════════════════════════════════════════════════
+    # 指令：/搜索优化器
+    # ══════════════════════════════════════════════════════════
+
+    @filter.command("搜索优化器")
+    async def cmd_status(self, event: AstrMessageEvent):
+        """查看运行统计"""
+        model = "规则提取"
+        if self.preprocess_provider_id:
+            model = await self._get_provider_display_name(
+                self.preprocess_provider_id
+            ) or self.preprocess_provider_id
+
+        cache_count = len(self._cache)
+        lines = [
+            "📊 搜索结果优化器",
+            f"  模式: {'LLM 摘要' if self.preprocess_provider_id else '规则提取'}",
+            f"  模型: {model}",
+            f"  优化搜索: {'✅' if self.optimize_search else '❌'}",
+            f"  缓存: {cache_count}/{self.max_cache_entries} 条 ({self.cache_days}天)",
+            f"  摘要上限: {self.max_summary_chars} 字符",
+            f"  缓存命中: {self._cache_hits} 次",
+            f"  累计处理: {self._preprocess_count} 次",
+            f"  累计节省: {self._total_chars_saved} 字符",
+        ]
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("清除缓存")
+    async def cmd_clear_cache(self, event: AstrMessageEvent):
+        """清空搜索优化器缓存"""
+        count = self._cache_clear()
+        yield event.plain_result(f"✅ 已清除 {count} 条缓存")
+
+    # ══════════════════════════════════════════════════════════
+    # Provider 辅助
+    # ══════════════════════════════════════════════════════════
+
+    async def _get_all_providers(self):
+        result = []
+        try:
+            pm = getattr(self.context, "provider_manager", None)
+            if not pm:
+                return result
+            providers = getattr(pm, "providers", None)
+            if not providers:
+                return result
+            if isinstance(providers, dict):
+                for pid, prov in providers.items():
+                    info = {"id": pid}
+                    m = getattr(prov, "model_name", None) or getattr(prov, "model", None)
+                    if m:
+                        info["model"] = str(m)
+                    result.append(info)
+        except Exception:
+            pass
+        return result
+
+    async def _get_provider_display_name(self, pid):
+        if not pid:
+            return None
+        for p in await self._get_all_providers():
+            if p["id"] == pid:
+                return p.get("model", pid)
+        return None
+
+    # ══════════════════════════════════════════════════════════
+    # 生命周期
+    # ══════════════════════════════════════════════════════════
+
+    async def terminate(self):
+        self._save_cache(force=True)
+        if self._preprocess_count > 0 or self._cache_hits > 0:
+            logger.info(
+                f"[搜索优化器] 停止: 处理 {self._preprocess_count} 次，"
+                f"缓存命中 {self._cache_hits} 次，"
+                f"节省 {self._total_chars_saved} 字符"
+            )
