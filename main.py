@@ -17,7 +17,6 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
-from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 # ─── 尝试导入 Bing 搜索模块 ─────────────────────────────────
 _BING_AVAILABLE = False
@@ -641,29 +640,13 @@ class SearchOptimizerPlugin(Star):
             logger.warning(f"[搜索优化器] 注入失败: {e}")
 
     def _find_cached_from_context(self, req: ProviderRequest, user_msg: str) -> Optional[str]:
-        """从对话历史中查找之前的搜索结果（利用 AstrBot 自带的对话持久化）。"""
-        # 方法1: 从 req 对象获取上下文
+        """从对话上下文中查找之前的搜索结果。"""
         contexts = None
         for attr in ('contexts', 'messages', 'conversation_context'):
             contexts = getattr(req, attr, None)
             if contexts and isinstance(contexts, list):
                 break
-
-        # 方法2: 从 ConversationManager 获取对话历史
         if not contexts:
-            try:
-                uid = event.unified_msg_origin if hasattr(self, '_current_event') else None
-                if not uid:
-                    return None
-                conv_mgr = self.context.conversation_manager
-                curr_cid = await conv_mgr.get_curr_conversation_id(uid)
-                if curr_cid:
-                    conv = await conv_mgr.get_conversation(uid, curr_cid)
-                    if conv and conv.history:
-                        # 从历史文本中查找搜索结果
-                        return self._extract_search_from_history(conv.history)
-            except Exception:
-                pass
             return None
 
         # 从后往前找最近的工具返回消息
@@ -679,24 +662,6 @@ class SearchOptimizerPlugin(Star):
                 clean = text.replace('<compressed>\n', '').replace('<compressed>', '')
                 if clean:
                     return clean
-        return None
-
-    def _extract_search_from_history(self, history: str) -> Optional[str]:
-        """从对话历史文本中提取搜索结果。"""
-        # 查找 JSON 格式的搜索结果
-        try:
-            # 尝试找到 JSON 块
-            import re as re_mod
-            json_blocks = re_mod.findall(r'\{[^{}]*"results"[^{}]*\[.*?\][^{}]*\}', history, re.DOTALL)
-            for block in json_blocks:
-                try:
-                    data = json.loads(block)
-                    if 'results' in data and isinstance(data['results'], list):
-                        return block
-                except json.JSONDecodeError:
-                    continue
-        except Exception:
-            pass
         return None
 
     def _get_user_message(self, req: ProviderRequest) -> str:
@@ -1047,7 +1012,6 @@ class SearchOptimizerPlugin(Star):
         model = "规则提取"
         if self.preprocess_provider_id:
             model = await self._get_provider_display_name(self.preprocess_provider_id) or self.preprocess_provider_id
-        cache_count = len(self._cache)
         ratio = "-"
         if self._preprocess_count > 0 and self._total_chars_saved > 0:
             avg = self._total_chars_saved / self._preprocess_count
@@ -1071,10 +1035,9 @@ class SearchOptimizerPlugin(Star):
             "─" * 24,
             f"优化搜索: {'✅' if self.optimize_search else '❌'}",
             f"小模型回答: {'✅' if self.small_model_answer else '❌'}",
-            f"缓存: {cache_count}/{self.max_cache_entries} 条（{self.cache_days} 天过期）",
             "─" * 24,
             f"累计处理: {self._preprocess_count} 次",
-            f"缓存命中: {self._cache_hits} 次（命中率 {hit_rate}）",
+            f"历史命中: {self._cache_hits} 次（命中率 {hit_rate}）",
             f"压缩率: {ratio}",
             f"节省字符: {self._total_chars_saved:,}",
             f"节省 Token: ~{int(tokens_saved):,}",
@@ -1122,10 +1085,9 @@ class SearchOptimizerPlugin(Star):
     # ══════════════════════════════════════════════════════════
 
     async def terminate(self):
-        pass
         if self._preprocess_count > 0 or self._cache_hits > 0:
             logger.info(
                 f"[搜索优化器] 停止: 处理 {self._preprocess_count} 次，"
-                f"缓存命中 {self._cache_hits} 次，"
+                f"历史命中 {self._cache_hits} 次，"
                 f"节省 {self._total_chars_saved} 字符"
             )
