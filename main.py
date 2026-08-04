@@ -290,10 +290,16 @@ class SearchOptimizerPlugin(Star):
                 if not cleaned:
                     continue
 
-                if self.preprocess_provider_id:
-                    summary = await self._llm_preprocess(tool_name, {}, cleaned, source_urls)
-                else:
-                    summary = self._rule_extract(tool_name, {}, cleaned, source_urls)
+                # 第一阶段：规则提取
+                summary = self._rule_extract(tool_name, {}, cleaned, source_urls)
+                mode = '规则'
+
+                # 第二阶段：小模型进一步压缩
+                if summary and self.preprocess_provider_id:
+                    llm_result = await self._llm_preprocess(tool_name, {}, summary, source_urls)
+                    if llm_result and len(llm_result) < len(summary):
+                        summary = llm_result
+                        mode = '规则+LLM'
 
                 if summary and len(summary) < len(text):
                     summary = f"<compressed>\n{summary}"
@@ -301,7 +307,6 @@ class SearchOptimizerPlugin(Star):
                     saved = len(text) - len(summary)
                     self._total_chars_saved += saved
                     self._preprocess_count += 1
-                    mode = 'LLM' if self.preprocess_provider_id else '规则'
                     logger.info(
                         f"[搜索优化器] [{mode}] {len(text)}→{len(summary)} "
                         f"(省 {saved}，累计 {self._total_chars_saved})"
@@ -455,14 +460,17 @@ class SearchOptimizerPlugin(Star):
             cleaned = self._strip_noise(text)
             if not cleaned:
                 return None, None
-            if self.preprocess_provider_id:
-                summary = await self._llm_preprocess(
-                    tool_name, tool_args, cleaned, source_urls
+            # 第一阶段：规则提取
+            summary = self._rule_extract(
+                tool_name, tool_args, cleaned, source_urls
+            )
+            # 第二阶段：小模型进一步压缩
+            if summary and self.preprocess_provider_id:
+                llm_result = await self._llm_preprocess(
+                    tool_name, tool_args, summary, source_urls
                 )
-            else:
-                summary = self._rule_extract(
-                    tool_name, tool_args, cleaned, source_urls
-                )
+                if llm_result and len(llm_result) < len(summary):
+                    summary = llm_result
             return item, (original_len, summary)
 
         results = await asyncio.gather(
@@ -483,7 +491,7 @@ class SearchOptimizerPlugin(Star):
                 saved = original_len - len(summary)
                 self._total_chars_saved += saved
                 self._preprocess_count += 1
-                mode = "LLM" if self.preprocess_provider_id else "规则"
+                mode = "规则+LLM" if self.preprocess_provider_id else "规则"
                 logger.info(
                     f"[搜索优化器] [{mode}] {original_len}→{len(summary)} "
                     f"(省 {saved}，累计 {self._total_chars_saved})"
@@ -558,23 +566,13 @@ class SearchOptimizerPlugin(Star):
                 result += "\n\n来源:\n" + "\n".join(f"- {u}" for u in source_urls[:5])
             return result
         except Exception as e:
-            logger.error(f"[搜索优化器] LLM 失败，回退规则: {e}")
-            return self._rule_extract(tool_name, tool_args, content, source_urls)
+            logger.error(f"[搜索优化器] LLM 压缩失败: {e}")
+            return None
 
     def _build_prompt(self, tool_name, tool_args, content):
-        name = tool_name.lower()
-        if "fetch" in name or "browse" in name:
-            p = "从以下网页正文中提取关键信息，去除无关内容，输出精炼摘要。"
-        elif "search" in name:
-            p = "从以下搜索结果中提取关键信息，保留标题和核心内容。"
-        else:
-            p = "从以下内容中提取关键信息，输出精炼摘要。"
+        p = "以下内容已经过初步清洗，请进一步精简归纳，保留核心信息，输出精炼摘要。"
         parts = [p]
-        if tool_args:
-            for k in ("keywords", "query", "urls", "url"):
-                if k in tool_args:
-                    parts.append(f"\n{k}: {tool_args[k]}")
-        parts.append(f"\n--- 原始内容 ---\n{content}")
+        parts.append(f"\n--- 内容 ---\n{content}")
         parts.append(f"\n--- 输出摘要（≤{self.max_summary_chars} 字符）---")
         return "\n".join(parts)
 
@@ -791,7 +789,7 @@ class SearchOptimizerPlugin(Star):
         if self.small_model_answer and self.preprocess_provider_id:
             mode_desc = "小模型直接回答"
         elif self.preprocess_provider_id:
-            mode_desc = "LLM 摘要压缩"
+            mode_desc = "规则提取 + LLM 精简"
         else:
             mode_desc = "规则提取（零 LLM）"
 
