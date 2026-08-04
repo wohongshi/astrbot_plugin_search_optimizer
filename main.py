@@ -503,10 +503,6 @@ class SearchOptimizerPlugin(Star):
         self._preprocess_count = 0
         self._cache_hits = 0
 
-        # 内存缓存
-        self._cache: dict = {}
-        self._cache_loaded = False
-
         # 设置浏览器选择
         global _BROWSER_CHOICE
         _BROWSER_CHOICE = self.browser
@@ -581,11 +577,6 @@ class SearchOptimizerPlugin(Star):
                 f"[搜索优化器] [{mode}] {original_len}→{len(summary)} "
                 f"(省 {saved}，累计 {self._total_chars_saved})"
             )
-            # 缓存
-            if self.optimize_search:
-                cache_key = self._extract_query_from_args(args)
-                if cache_key:
-                    await self._cache_set(cache_key, summary)
             return summary
 
         return raw_content
@@ -601,81 +592,7 @@ class SearchOptimizerPlugin(Star):
         return ""
 
     # ══════════════════════════════════════════════════════════
-    # 缓存系统（AstrBot KV 存储）
-    # ══════════════════════════════════════════════════════════
-
-    async def _ensure_cache_loaded(self):
-        if self._cache_loaded:
-            return
-        try:
-            data = await self.get_kv_data("cache", None)
-            if data and isinstance(data, dict):
-                self._cache = data
-                logger.info(f"[搜索优化器] 从存储加载 {len(self._cache)} 条缓存")
-        except Exception as e:
-            logger.warning(f"[搜索优化器] 加载缓存失败: {e}")
-        self._cache_loaded = True
-
-    async def _persist_cache(self):
-        try:
-            now = time.time()
-            max_age = self.cache_days * 86400
-            # 清理过期
-            expired = [k for k, v in self._cache.items() if now - v.get("ts", 0) > max_age]
-            for k in expired:
-                del self._cache[k]
-            # LRU 淘汰
-            if len(self._cache) > self.max_cache_entries:
-                sorted_keys = sorted(
-                    self._cache.keys(),
-                    key=lambda k: (self._cache[k].get("hits", 0), self._cache[k].get("ts", 0)),
-                )
-                for k in sorted_keys[: len(self._cache) - self.max_cache_entries]:
-                    del self._cache[k]
-            await self.put_kv_data("cache", self._cache)
-        except Exception as e:
-            logger.warning(f"[搜索优化器] 保存缓存失败: {e}")
-
-    async def _cache_get(self, query: str) -> Optional[str]:
-        await self._ensure_cache_loaded()
-        key = _normalize_query(query)
-        entry = self._cache.get(key)
-        if not entry:
-            q_words = set(key.split())
-            for ck, ce in self._cache.items():
-                cw = set(ck.split())
-                if q_words and cw and len(q_words & cw) / min(len(q_words), len(cw)) > 0.6:
-                    entry = ce
-                    break
-        if not entry:
-            return None
-        if time.time() - entry.get("ts", 0) > self.cache_days * 86400:
-            del self._cache[key]
-            return None
-        entry["hits"] = entry.get("hits", 0) + 1
-        return entry.get("content", "")
-
-    async def _cache_set(self, query: str, content: str):
-        await self._ensure_cache_loaded()
-        key = _normalize_query(query)
-        if not key:
-            return
-        self._cache[key] = {"content": content, "ts": time.time(), "hits": 0, "chars": len(content)}
-        logger.info(f"[搜索优化器] 缓存写入: '{key}' ({len(content)} 字符), 总条数={len(self._cache)}")
-        await self._persist_cache()
-
-    async def _cache_clear(self):
-        await self._ensure_cache_loaded()
-        count = len(self._cache)
-        self._cache.clear()
-        try:
-            await self.delete_kv_data("cache")
-        except Exception:
-            pass
-        return count
-
-    # ══════════════════════════════════════════════════════════
-    # 钩子：缓存注入
+    # 钩子：缓存注入（从对话历史中查找之前的搜索结果）
     # ══════════════════════════════════════════════════════════
 
     @filter.on_llm_request()
@@ -685,11 +602,14 @@ class SearchOptimizerPlugin(Star):
         user_msg = self._get_user_message(req)
         if not user_msg or len(user_msg) < 5:
             return
-        cached = await self._cache_get(user_msg)
+
+        # 从对话历史中查找之前的搜索结果
+        cached = self._find_cached_from_context(req, user_msg)
         if not cached:
             return
+
         self._cache_hits += 1
-        logger.info(f"[搜索优化器] 缓存命中 (累计 {self._cache_hits}): {user_msg[:30]}...")
+        logger.info(f"[搜索优化器] 命中历史搜索结果 (累计 {self._cache_hits}): {user_msg[:30]}...")
 
         try:
             from astrbot.core.agent.message import TextPart
@@ -710,7 +630,7 @@ class SearchOptimizerPlugin(Star):
 
             inject = (
                 f"<cached_search_results>\n"
-                f"以下是之前搜索「{user_msg[:50]}」的预处理结果。"
+                f"以下是之前搜索的相关结果。"
                 f"已有足够信息回答此问题，无需调用 web_search 或 web_fetch。"
                 f"请直接基于以下内容回答：\n\n{cached}\n"
                 f"</cached_search_results>"
@@ -719,6 +639,65 @@ class SearchOptimizerPlugin(Star):
                 req.extra_user_content_parts.append(TextPart(text=inject).mark_as_temp())
         except Exception as e:
             logger.warning(f"[搜索优化器] 注入失败: {e}")
+
+    def _find_cached_from_context(self, req: ProviderRequest, user_msg: str) -> Optional[str]:
+        """从对话历史中查找之前的搜索结果（利用 AstrBot 自带的对话持久化）。"""
+        # 方法1: 从 req 对象获取上下文
+        contexts = None
+        for attr in ('contexts', 'messages', 'conversation_context'):
+            contexts = getattr(req, attr, None)
+            if contexts and isinstance(contexts, list):
+                break
+
+        # 方法2: 从 ConversationManager 获取对话历史
+        if not contexts:
+            try:
+                uid = event.unified_msg_origin if hasattr(self, '_current_event') else None
+                if not uid:
+                    return None
+                conv_mgr = self.context.conversation_manager
+                curr_cid = await conv_mgr.get_curr_conversation_id(uid)
+                if curr_cid:
+                    conv = await conv_mgr.get_conversation(uid, curr_cid)
+                    if conv and conv.history:
+                        # 从历史文本中查找搜索结果
+                        return self._extract_search_from_history(conv.history)
+            except Exception:
+                pass
+            return None
+
+        # 从后往前找最近的工具返回消息
+        for msg in reversed(contexts):
+            role = getattr(msg, 'role', None)
+            if role not in ('tool', 'function'):
+                continue
+            content = getattr(msg, 'content', None)
+            text = self._extract_text(content)
+            if not text or len(text) < 200:
+                continue
+            if '<compressed>' in text or _is_json_search_result(text) or len(text) > 500:
+                clean = text.replace('<compressed>\n', '').replace('<compressed>', '')
+                if clean:
+                    return clean
+        return None
+
+    def _extract_search_from_history(self, history: str) -> Optional[str]:
+        """从对话历史文本中提取搜索结果。"""
+        # 查找 JSON 格式的搜索结果
+        try:
+            # 尝试找到 JSON 块
+            import re as re_mod
+            json_blocks = re_mod.findall(r'\{[^{}]*"results"[^{}]*\[.*?\][^{}]*\}', history, re.DOTALL)
+            for block in json_blocks:
+                try:
+                    data = json.loads(block)
+                    if 'results' in data and isinstance(data['results'], list):
+                        return block
+                except json.JSONDecodeError:
+                    continue
+        except Exception:
+            pass
+        return None
 
     def _get_user_message(self, req: ProviderRequest) -> str:
         try:
@@ -1104,8 +1083,7 @@ class SearchOptimizerPlugin(Star):
 
     @filter.command("清除缓存")
     async def cmd_clear_cache(self, event: AstrMessageEvent):
-        count = await self._cache_clear()
-        yield event.plain_result(f"✅ 已清除 {count} 条缓存")
+        yield event.plain_result("✅ 当前使用对话历史模式，无需清除缓存")
 
     # ══════════════════════════════════════════════════════════
     # Provider 辅助
@@ -1144,7 +1122,7 @@ class SearchOptimizerPlugin(Star):
     # ══════════════════════════════════════════════════════════
 
     async def terminate(self):
-        await self._persist_cache()
+        pass
         if self._preprocess_count > 0 or self._cache_hits > 0:
             logger.info(
                 f"[搜索优化器] 停止: 处理 {self._preprocess_count} 次，"
