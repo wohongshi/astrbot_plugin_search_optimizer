@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import re
 import random
 import time
@@ -92,7 +93,32 @@ def _should_fetch_detail(url: str) -> bool:
 
 
 async def _fetch_detail(url: str, max_chars: int = 3000) -> str:
-    """抓取详情页正文。"""
+    """抓取详情页正文，先 aiohttp，内容不足时用 DrissionPage 渲染。"""
+    # aiohttp 快速抓取
+    text = await _fetch_detail_aiohttp(url, max_chars)
+    if text and len(text) > 200 and "Loading" not in text[:100]:
+        return text
+
+    # DrissionPage 系统 Chromium 渲染
+    import shutil
+    chromium = None
+    for p in ["/usr/bin/chromium", "/usr/bin/chromium-browser",
+              "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"]:
+        if shutil.which(p) or os.path.isfile(p):
+            chromium = p
+            break
+    if chromium:
+        dp_text = await asyncio.to_thread(
+            _fetch_detail_drissionpage, url, chromium, max_chars
+        )
+        if dp_text and len(dp_text) > len(text or ""):
+            return dp_text
+
+    return text or ""
+
+
+async def _fetch_detail_aiohttp(url: str, max_chars: int) -> str:
+    """aiohttp 快速抓取详情。"""
     try:
         import trafilatura
         session = await _get_session()
@@ -127,6 +153,72 @@ async def _fetch_detail(url: str, max_chars: int = 3000) -> str:
         return text
     except Exception:
         return ""
+
+
+def _fetch_detail_drissionpage(url: str, chromium_path: str, max_chars: int) -> str:
+    """DrissionPage 同步抓取详情（在线程中运行）。"""
+    page = None
+    try:
+        from DrissionPage import ChromiumPage, ChromiumOptions
+        co = ChromiumOptions()
+        co.set_browser_path(chromium_path)
+        co.set_argument("--headless=new")
+        co.set_argument("--no-sandbox")
+        co.set_argument("--disable-gpu")
+        co.set_argument("--disable-dev-shm-usage")
+        co.set_argument("--disable-blink-features=AutomationControlled")
+
+        page = ChromiumPage(addr_or_opts=co)
+        page.get(url, timeout=15)
+        page.wait.doc_loaded()
+        try:
+            page.wait.ele_displayed("tag:body", timeout=8)
+        except Exception:
+            pass
+        for _ in range(3):
+            page.scroll.down(1000)
+            try:
+                page.wait.load_complete(timeout=2)
+            except Exception:
+                pass
+
+        text = ""
+        try:
+            body = page.ele("tag:body", timeout=3)
+            if body:
+                text = body.text.strip()
+        except Exception:
+            pass
+        if not text:
+            try:
+                text = page.run_js("document.body?.innerText || ''").strip()
+            except Exception:
+                pass
+        if not text:
+            return ""
+
+        title = ""
+        try:
+            t = page.ele("tag:title", timeout=2)
+            if t:
+                title = t.text.strip()
+        except Exception:
+            pass
+        if title:
+            text = f"标题: {title}\n\n{text}"
+
+        text = re.sub(r"\n\s*\n", "\n\n", text).strip()
+        if max_chars > 0 and len(text) > max_chars:
+            text = text[:max_chars] + "\n...[已截断]"
+        return text
+    except Exception:
+        return ""
+    finally:
+        if page:
+            try:
+                page.quit()
+            except Exception:
+                pass
 
 
 async def search_bing_async(
