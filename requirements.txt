@@ -1,1 +1,2 @@
-# 此插件仅依赖 AstrBot 核心 API，无需额外第三方库
+DrissionPage>=4.0.0
+trafilatura>=1.6.0

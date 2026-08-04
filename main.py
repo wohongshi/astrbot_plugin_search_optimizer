@@ -1,10 +1,7 @@
 """
-AstrBot 搜索结果优化器 v5
-功能：
-1. 拦截搜索/抓取工具结果，用低成本模型或规则提取压缩内容
-2. 缓存预处理结果，命中缓存时跳过搜索，直接注入上下文
-3. LRU 缓存淘汰，防止缓存无限增长
-4. 多 URL 并行预处理
+AstrBot 搜索结果优化器 v6
+集成 Bing 搜索功能，搜索后立刻压缩再返回给 LLM。
+第一次搜索就能节省 Token。
 """
 
 import asyncio
@@ -22,12 +19,304 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
+# ─── 尝试导入 Bing 搜索模块 ─────────────────────────────────
+_BING_AVAILABLE = False
+_search_bing = None
+_fetch_page = None
+
+try:
+    # 尝试从已安装的 Bing 插件导入
+    import importlib
+    import sys
+
+    # 尝试多种导入路径
+    for mod_path in (
+        "astrbot_plugin_web_tools_ar.tools.bing_search",
+        "Bing_Web_Search.tools.bing_search",
+    ):
+        try:
+            mod = importlib.import_module(mod_path)
+            _search_bing = getattr(mod, "search_bing", None)
+            break
+        except ImportError:
+            continue
+
+    for mod_path in (
+        "astrbot_plugin_web_tools_ar.tools.web_fetch",
+        "Bing_Web_Search.tools.web_fetch",
+    ):
+        try:
+            mod = importlib.import_module(mod_path)
+            _fetch_page = getattr(mod, "fetch_page", None)
+            break
+        except ImportError:
+            continue
+
+    if _search_bing and _fetch_page:
+        _BING_AVAILABLE = True
+except Exception:
+    pass
+
+# ─── 内置搜索实现（Bing 插件未安装时使用）──────────────────────
+if not _BING_AVAILABLE:
+    try:
+        import threading
+        import tempfile
+        import shutil
+        import platform
+        from functools import lru_cache
+        from DrissionPage import ChromiumPage, ChromiumOptions
+
+        _next_port = 10000
+        _port_lock = threading.Lock()
+
+        def _alloc_port() -> int:
+            global _next_port
+            with _port_lock:
+                port = _next_port
+                _next_port += 1
+                if _next_port > 60000:
+                    _next_port = 10000
+                return port
+
+        @lru_cache(maxsize=1)
+        def _find_browser_path() -> str:
+            system = platform.system()
+            if system == "Windows":
+                candidates = [
+                    "C:/Program Files/Google/Chrome/Application/chrome.exe",
+                    "C:/Program Files (x86)/Google/Chrome/Application/chrome.exe",
+                    "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+                    "C:/Program Files/Microsoft/Edge/Application/msedge.exe",
+                ]
+            elif system == "Darwin":
+                candidates = [
+                    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                ]
+            else:
+                candidates = [
+                    "/usr/bin/chromium",
+                    "/usr/bin/chromium-browser",
+                    "/usr/bin/google-chrome",
+                    "/usr/bin/google-chrome-stable",
+                    "/usr/bin/microsoft-edge",
+                    "/usr/bin/microsoft-edge-stable",
+                ]
+            for p in candidates:
+                if os.path.exists(p):
+                    return p
+            raise FileNotFoundError("未找到浏览器，请安装 Chromium/Chrome")
+
+        _MAX_CONCURRENT = 4
+        _browser_semaphore = threading.Semaphore(_MAX_CONCURRENT)
+        _DRISSIONPAGE_USERDATA = os.path.join(tempfile.gettempdir(), "DrissionPage", "userData")
+
+        def _search_bing(keywords: list, max_results: int = 8, timeout: int = 45) -> str:
+            """内置 Bing 搜索实现"""
+            if not keywords:
+                return json.dumps({"error": "未提供关键词"}, ensure_ascii=False)
+            keyword = keywords[0] if isinstance(keywords, list) else keywords
+            max_retries = 3
+            with _browser_semaphore:
+                user_data_dir = None
+                port = _alloc_port()
+                co = ChromiumOptions()
+                co.set_browser_path(_find_browser_path())
+                co.set_argument("--disable-blink-features=AutomationControlled")
+                co.set_argument("--no-sandbox")
+                co.set_argument("--remote-debugging-port=0")
+                co.set_argument("--disable-gpu")
+                co.set_local_port(port)
+                try:
+                    user_data_dir = tempfile.mkdtemp(prefix="bing_search_")
+                    co.set_argument(f"--user-data-dir={user_data_dir}")
+                except Exception:
+                    pass
+                page = ChromiumPage(addr_or_opts=co)
+                try:
+                    for retry in range(max_retries):
+                        page.get("https://www.bing.com", timeout=timeout)
+                        try:
+                            search_box = page.ele('#sb_form_q', timeout=5)
+                            if search_box:
+                                search_box.clear()
+                                search_box.input(keyword)
+                                search_btn = page.ele('#search_icon', timeout=2)
+                                if search_btn:
+                                    search_btn.click()
+                                else:
+                                    search_box.send_keys('\n')
+                                page.wait.doc_loaded()
+                        except Exception:
+                            from urllib.parse import quote
+                            page.get(f"https://www.bing.com/search?q={quote(keyword)}&count={max_results}", timeout=timeout)
+                        for _ in range(4):
+                            try:
+                                page.wait.ele_displayed('#b_results', timeout=3)
+                                break
+                            except Exception:
+                                page.refresh()
+                        for _ in range(3):
+                            try:
+                                before = len(page.eles('#b_results .b_algo'))
+                            except Exception:
+                                before = 0
+                            page.scroll.down(500)
+                            for _ in range(3):
+                                try:
+                                    after = len(page.eles('#b_results .b_algo'))
+                                except Exception:
+                                    after = 0
+                                if after > before:
+                                    break
+                                time.sleep(0.5)
+                        b_results = page.ele('#b_results', timeout=1)
+                        if b_results:
+                            result_items = b_results.children('.b_algo', timeout=0.5) or b_results.children('li', timeout=0.5)
+                        else:
+                            result_items = page.eles('.b_algo', timeout=1.5)
+                        results = []
+                        for li in (result_items or [])[:max_results]:
+                            try:
+                                h2 = li.ele('tag:h2', timeout=0.3)
+                                if not h2:
+                                    continue
+                                a_tag = h2.ele('tag:a', timeout=0.3)
+                                if not (a_tag and h2.text and a_tag.attr('href')):
+                                    continue
+                                title = h2.text.strip()
+                                url = a_tag.attr('href')
+                                snippet = ''
+                                p_tag = li.ele('tag:p', timeout=0.3)
+                                if p_tag:
+                                    snippet = p_tag.text.strip()
+                                date = ''
+                                if snippet:
+                                    dm = re.search(r'(\d{4}[-年]\d{1,2}[-月]\d{1,2}日?)', snippet)
+                                    if dm:
+                                        date = dm.group(1).replace('年', '-').replace('月', '-').replace('日', '')
+                                source = url.split('/')[2].replace('www.', '') if '/' in url else ''
+                                results.append({"rank": len(results)+1, "title": title, "url": url, "snippet": snippet, "date": date, "source": source})
+                            except Exception:
+                                continue
+                        if results:
+                            return json.dumps({"query": keyword, "total_results": len(results), "results": results}, ensure_ascii=False, indent=2)
+                        time.sleep(1)
+                    return json.dumps({"query": keyword, "total_results": 0, "results": [], "message": "多次重试后未获得结果"}, ensure_ascii=False)
+                except Exception as e:
+                    return json.dumps({"error": str(e), "query": keyword}, ensure_ascii=False)
+                finally:
+                    try:
+                        page.quit()
+                    except Exception:
+                        pass
+                    if user_data_dir:
+                        shutil.rmtree(user_data_dir, ignore_errors=True)
+                    try:
+                        if os.path.isdir(_DRISSIONPAGE_USERDATA):
+                            shutil.rmtree(_DRISSIONPAGE_USERDATA, ignore_errors=True)
+                    except Exception:
+                        pass
+
+        def _fetch_page(url: str, timeout: int = 10, retries: int = 3, max_chars: int = 10000) -> str:
+            """内置网页抓取实现"""
+            try:
+                import trafilatura
+                import ipaddress
+                from urllib.parse import urlparse
+            except ImportError:
+                return "缺少依赖: pip install trafilatura"
+            parsed = urlparse(url)
+            if parsed.scheme not in ("http", "https"):
+                return f"不支持的协议: {parsed.scheme}"
+            with _browser_semaphore:
+                for attempt in range(retries):
+                    page = None
+                    user_data_dir = None
+                    try:
+                        port = _alloc_port()
+                        co = ChromiumOptions()
+                        co.set_browser_path(_find_browser_path())
+                        co.set_argument("--disable-blink-features=AutomationControlled")
+                        co.set_argument("--no-sandbox")
+                        co.set_argument("--remote-debugging-port=0")
+                        co.set_argument("--disable-gpu")
+                        co.set_local_port(port)
+                        try:
+                            user_data_dir = tempfile.mkdtemp(prefix="web_fetch_")
+                            co.set_argument(f"--user-data-dir={user_data_dir}")
+                        except Exception:
+                            pass
+                        page = ChromiumPage(addr_or_opts=co)
+                        page.get(url, timeout=timeout)
+                        page.wait.doc_loaded()
+                        try:
+                            page.wait.ele_displayed('tag:body', timeout=10)
+                        except Exception:
+                            pass
+                        for _ in range(3):
+                            page.scroll.down(2000)
+                            try:
+                                page.wait.load_complete(timeout=2)
+                            except Exception:
+                                pass
+                        try:
+                            html_content = page.html
+                            extracted = trafilatura.extract(html_content, include_comments=False, include_tables=True)
+                            if extracted:
+                                text = re.sub(r'\n\s*\n', '\n\n', extracted.strip())
+                                title = ''
+                                try:
+                                    t = page.ele('tag:title', timeout=3)
+                                    if t:
+                                        title = t.text.strip()
+                                except Exception:
+                                    pass
+                                if title:
+                                    text = f"标题: {title}\n\n{text}"
+                                if max_chars > 0 and len(text) > max_chars:
+                                    text = text[:max_chars] + "\n\n[内容已截断]"
+                                return text
+                        except Exception:
+                            pass
+                        try:
+                            body = page.ele('tag:body', timeout=5)
+                            text = body.text.strip() if body else ""
+                        except Exception:
+                            text = ""
+                        if max_chars > 0 and len(text) > max_chars:
+                            text = text[:max_chars] + "\n\n[内容已截断]"
+                        return text or "页面内容为空"
+                    except Exception as e:
+                        if attempt < retries - 1:
+                            time.sleep(2 ** attempt)
+                    finally:
+                        if page:
+                            try:
+                                page.quit()
+                            except Exception:
+                                pass
+                        if user_data_dir:
+                            shutil.rmtree(user_data_dir, ignore_errors=True)
+                        try:
+                            if os.path.isdir(_DRISSIONPAGE_USERDATA):
+                                shutil.rmtree(_DRISSIONPAGE_USERDATA, ignore_errors=True)
+                        except Exception:
+                            pass
+                return f"获取页面失败，已重试{retries}次"
+
+        _BING_AVAILABLE = True
+        logger.info("[搜索优化器] 使用内置搜索实现")
+    except ImportError:
+        logger.warning("[搜索优化器] 未安装 Bing 插件且缺少 DrissionPage，搜索功能不可用")
+
 # ─── 搜索工具名特征 ────────────────────────────────────────
 _SEARCH_TOOL_PATTERNS = (
     "web_search", "web_fetch", "web_search_tool", "web_fetch_tool",
     "bing_search", "google_search",
     "tavily", "brave_search", "duckduckgo",
-    "astrbot_execute_shell",  # AstrBot 内置电脑能力（网页搜索等）
+    "astrbot_execute_shell",
 )
 
 
@@ -51,7 +340,7 @@ def _is_json_search_result(text: str) -> bool:
     return False
 
 
-# 时间敏感词：包含这些词的查询会把当天日期混入缓存 key
+# 时间敏感词
 _TIME_KEYWORDS = (
     "今天", "今日", "今晚", "今晨", "今早",
     "昨天", "昨日", "昨晚", "前天", "前日", "前晚",
@@ -76,7 +365,6 @@ _TIME_KEYWORDS = (
 
 
 def _normalize_query(text: str) -> str:
-    """归一化搜索关键词，包含时间敏感词时混入当天日期。"""
     t = text.lower().strip()
     t = re.sub(r'\s+', ' ', t)
     t = re.sub(r'[，。、；：！？,.;:!?\-\[\]\(\){}\"\'<>]', '', t)
@@ -87,32 +375,146 @@ def _normalize_query(text: str) -> str:
     return t
 
 
+# ══════════════════════════════════════════════════════════
+# FunctionTool 定义：搜索 + 预处理
+# ══════════════════════════════════════════════════════════
+
+try:
+    from pydantic import Field
+    from pydantic.dataclasses import dataclass
+    from astrbot.core.agent.run_context import ContextWrapper
+    from astrbot.core.agent.tool import FunctionTool, ToolExecResult, ToolSet
+    from astrbot.core.astr_agent_context import AstrAgentContext
+    from mcp.types import CallToolResult, TextContent
+
+    class OptimizedSearchTool(FunctionTool[AstrAgentContext]):
+        """优化版 Bing 搜索：搜索后立刻压缩结果。"""
+
+        name: str = "web_search"
+        description: str = "并发搜索互联网，可同时传入多个关键词。返回压缩后的精炼结果。"
+        parameters: dict = Field(
+            default_factory=lambda: {
+                "type": "object",
+                "properties": {
+                    "keywords": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "搜索关键词列表，可同时传入多个关键词并发搜索",
+                    },
+                },
+                "required": ["keywords"],
+            }
+        )
+
+        _plugin = None  # 指向插件实例
+
+        async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
+            keywords = kwargs.get("keywords", [])
+            if not keywords:
+                return ToolExecResult(content="未提供搜索关键词")
+
+            plugin = self._plugin
+            if not plugin or not _BING_AVAILABLE:
+                return ToolExecResult(content="搜索功能不可用")
+
+            # 执行搜索
+            loop = asyncio.get_event_loop()
+            raw_result = await loop.run_in_executor(None, _search_bing, keywords)
+
+            # 预处理
+            processed = await plugin._preprocess_tool_content("web_search", raw_result, keywords)
+            return ToolExecResult(content=processed)
+
+    class OptimizedFetchTool(FunctionTool[AstrAgentContext]):
+        """优化版网页抓取：抓取后立刻压缩内容。"""
+
+        name: str = "web_fetch"
+        description: str = "并发抓取多个 URL 的页面正文，返回压缩后的精炼内容。"
+        parameters: dict = Field(
+            default_factory=lambda: {
+                "type": "object",
+                "properties": {
+                    "urls": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "要抓取的 URL 列表",
+                    },
+                },
+                "required": ["urls"],
+            }
+        )
+
+        _plugin = None
+
+        async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
+            urls = kwargs.get("urls", [])
+            if not urls:
+                return ToolExecResult(content="未提供 URL")
+
+            plugin = self._plugin
+            if not plugin or not _BING_AVAILABLE:
+                return ToolExecResult(content="抓取功能不可用")
+
+            loop = asyncio.get_event_loop()
+
+            # 并发抓取
+            tasks = [loop.run_in_executor(None, _fetch_page, url) for url in urls]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            parts = []
+            for url, text in zip(urls, results):
+                if isinstance(text, Exception):
+                    parts.append(f"=== {url} ===\n抓取失败: {text}")
+                else:
+                    parts.append(f"=== {url} ===\n{text}")
+
+            raw_result = "\n\n".join(parts)
+
+            # 预处理
+            processed = await plugin._preprocess_tool_content("web_fetch", raw_result, urls)
+            return ToolExecResult(content=processed)
+
+    _TOOLS_AVAILABLE = True
+except ImportError:
+    _TOOLS_AVAILABLE = False
+    logger.info("[搜索优化器] FunctionTool 框架不可用，仅作为后处理插件运行")
+
+
+# ══════════════════════════════════════════════════════════
+# 插件主类
+# ══════════════════════════════════════════════════════════
+
 class SearchOptimizerPlugin(Star):
-    """搜索结果优化器：压缩搜索结果 + 缓存加速。"""
+    """搜索结果优化器：集成搜索 + 压缩 + 缓存。"""
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
         self._load_config()
 
-        # 统计
         self._total_chars_saved = 0
         self._preprocess_count = 0
         self._cache_hits = 0
         self._cache_dirty = False
 
         # 缓存
-        self._cache_dir = str(
-            Path(get_astrbot_data_path()) / "plugin_data" / "search_optimizer"
-        )
+        self._cache_dir = str(Path(get_astrbot_data_path()) / "plugin_data" / "search_optimizer")
         os.makedirs(self._cache_dir, exist_ok=True)
         self._cache_file = os.path.join(self._cache_dir, "cache.json")
         self._cache: dict = self._load_cache()
         self._clean_expired_cache()
         self._evict_lru()
 
-        if not self.preprocess_provider_id:
-            logger.info("[搜索优化器] 未配置预处理模型，使用规则提取模式")
+        # 注册优化版搜索工具
+        self._tools_registered = False
+        if _TOOLS_AVAILABLE and _BING_AVAILABLE:
+            self._register_tools()
+
+        logger.info(
+            f"[搜索优化器] 启动: 搜索={'✅' if _BING_AVAILABLE else '❌'} "
+            f"工具={'✅' if _TOOLS_AVAILABLE else '❌'} "
+            f"模式={'LLM' if self.preprocess_provider_id else '规则'}"
+        )
 
     def _load_config(self):
         self.preprocess_provider_id = self.config.get("preprocess_provider_id", "")
@@ -121,6 +523,75 @@ class SearchOptimizerPlugin(Star):
         self.max_cache_entries = self.config.get("max_cache_entries", 200)
         self.max_summary_chars = self.config.get("max_summary_chars", 1500)
         self.small_model_answer = self.config.get("small_model_answer", False)
+
+    def _register_tools(self):
+        """注册优化版搜索工具，替换原始工具。"""
+        try:
+            search_tool = OptimizedSearchTool()
+            search_tool._plugin = self
+            fetch_tool = OptimizedFetchTool()
+            fetch_tool._plugin = self
+            self.context.add_llm_tools(search_tool, fetch_tool)
+            self._tools_registered = True
+            logger.info("[搜索优化器] 已注册优化版 web_search / web_fetch 工具")
+        except Exception as e:
+            logger.warning(f"[搜索优化器] 注册工具失败: {e}")
+
+    # ══════════════════════════════════════════════════════════
+    # 核心：搜索结果预处理
+    # ══════════════════════════════════════════════════════════
+
+    async def _preprocess_tool_content(
+        self, tool_name: str, raw_content: str, args
+    ) -> str:
+        """工具执行后立刻预处理，返回压缩内容。"""
+        if not raw_content or len(raw_content) < 2000:
+            return raw_content
+
+        original_len = len(raw_content)
+        logger.info(f"[搜索优化器] {tool_name} 原始 {original_len} 字符，开始压缩...")
+
+        # 提取 URL（去噪前）
+        source_urls = self._extract_urls(raw_content)
+
+        # 去噪
+        cleaned = self._strip_noise(raw_content)
+        if not cleaned:
+            return raw_content
+
+        # 压缩
+        if self.preprocess_provider_id:
+            summary = await self._llm_preprocess(tool_name, args, cleaned, source_urls)
+        else:
+            summary = self._rule_extract(tool_name, args, cleaned, source_urls)
+
+        if summary and len(summary) < original_len:
+            saved = original_len - len(summary)
+            self._total_chars_saved += saved
+            self._preprocess_count += 1
+            mode = "LLM" if self.preprocess_provider_id else "规则"
+            logger.info(
+                f"[搜索优化器] [{mode}] {original_len}→{len(summary)} "
+                f"(省 {saved}，累计 {self._total_chars_saved})"
+            )
+            # 缓存
+            if self.optimize_search:
+                cache_key = self._extract_query_from_args(args)
+                if cache_key:
+                    self._cache_set(cache_key, summary)
+            return summary
+
+        return raw_content
+
+    def _extract_query_from_args(self, args) -> str:
+        if isinstance(args, list):
+            return " ".join(str(a) for a in args)
+        if isinstance(args, dict):
+            for k in ("keywords", "query", "q", "urls"):
+                v = args.get(k)
+                if v:
+                    return " ".join(str(x) for x in v) if isinstance(v, list) else str(v)
+        return ""
 
     # ══════════════════════════════════════════════════════════
     # 缓存系统
@@ -131,8 +602,8 @@ class SearchOptimizerPlugin(Star):
             if os.path.exists(self._cache_file):
                 with open(self._cache_file, "r", encoding="utf-8") as f:
                     return json.load(f)
-        except Exception as e:
-            logger.warning(f"[搜索优化器] 加载缓存失败: {e}")
+        except Exception:
+            pass
         return {}
 
     def _save_cache(self, force=False):
@@ -142,54 +613,42 @@ class SearchOptimizerPlugin(Star):
             with open(self._cache_file, "w", encoding="utf-8") as f:
                 json.dump(self._cache, f, ensure_ascii=False, indent=2)
             self._cache_dirty = False
-        except Exception as e:
-            logger.warning(f"[搜索优化器] 保存缓存失败: {e}")
+        except Exception:
+            pass
 
     def _clean_expired_cache(self):
         now = time.time()
         max_age = self.cache_days * 86400
-        expired = [
-            k for k, v in self._cache.items()
-            if now - v.get("ts", 0) > max_age
-        ]
+        expired = [k for k, v in self._cache.items() if now - v.get("ts", 0) > max_age]
         for k in expired:
             del self._cache[k]
         if expired:
             self._cache_dirty = True
             self._save_cache()
-            logger.info(f"[搜索优化器] 清理 {len(expired)} 条过期缓存")
 
     def _evict_lru(self):
-        """LRU 淘汰：缓存条数超限时，删除命中次数最少 + 最久未用的条目。"""
         if len(self._cache) <= self.max_cache_entries:
             return
-        # 按 (hits, ts) 排序，hits 少 + 时间早的排前面 → 删除
         sorted_keys = sorted(
             self._cache.keys(),
-            key=lambda k: (
-                self._cache[k].get("hits", 0),
-                self._cache[k].get("ts", 0),
-            ),
+            key=lambda k: (self._cache[k].get("hits", 0), self._cache[k].get("ts", 0)),
         )
         to_remove = len(self._cache) - self.max_cache_entries
         for k in sorted_keys[:to_remove]:
             del self._cache[k]
         if to_remove > 0:
             self._cache_dirty = True
-            logger.info(f"[搜索优化器] LRU 淘汰 {to_remove} 条缓存")
 
     def _cache_get(self, query: str) -> Optional[str]:
         key = _normalize_query(query)
         entry = self._cache.get(key)
         if not entry:
-            # 模糊匹配
             q_words = set(key.split())
             for cached_key, cached_entry in self._cache.items():
                 c_words = set(cached_key.split())
                 if not q_words or not c_words:
                     continue
-                overlap = len(q_words & c_words)
-                if overlap / min(len(q_words), len(c_words)) > 0.6:
+                if len(q_words & c_words) / min(len(q_words), len(c_words)) > 0.6:
                     entry = cached_entry
                     key = cached_key
                     break
@@ -207,18 +666,11 @@ class SearchOptimizerPlugin(Star):
         key = _normalize_query(query)
         if not key:
             return
-        self._cache[key] = {
-            "content": content,
-            "ts": time.time(),
-            "hits": 0,
-            "chars": len(content),
-        }
+        self._cache[key] = {"content": content, "ts": time.time(), "hits": 0, "chars": len(content)}
         self._cache_dirty = True
-        # 写入后检查是否需要淘汰
         self._evict_lru()
 
     def _cache_clear(self):
-        """清空全部缓存。"""
         count = len(self._cache)
         self._cache.clear()
         self._cache_dirty = True
@@ -226,101 +678,13 @@ class SearchOptimizerPlugin(Star):
         return count
 
     # ══════════════════════════════════════════════════════════
-    # 钩子：on_agent_done（agent 运行完成后触发，扫描工具结果）
-    # ══════════════════════════════════════════════════════════
-
-    @filter.on_agent_done()
-    async def on_agent_done(self, event, run_context, resp):
-        """agent 运行完成后，扫描对话中的工具结果，预处理并缓存。"""
-        try:
-            # 获取对话历史
-            messages = None
-            ctx = run_context
-            for attr in ('messages', 'conversation_context', 'history', 'contexts'):
-                messages = getattr(ctx, attr, None)
-                if messages and isinstance(messages, list):
-                    break
-            # 尝试从 context 子对象获取
-            if not messages:
-                inner = getattr(ctx, 'context', None)
-                if inner:
-                    for attr in ('messages', 'conversation_context', 'history'):
-                        messages = getattr(inner, attr, None)
-                        if messages and isinstance(messages, list):
-                            break
-            if not messages:
-                return
-
-            for msg in messages:
-                role = getattr(msg, 'role', None)
-                if role not in ('tool', 'function'):
-                    continue
-                tool_name = getattr(msg, 'name', '') or ''
-                content = getattr(msg, 'content', None)
-                text = self._extract_text(content)
-                if not text or len(text) < 2000:
-                    continue
-                if '<compressed>' in text:
-                    continue
-
-                # 判断是否为搜索/抓取内容
-                is_search = (
-                    _is_search_tool(tool_name)
-                    or _is_json_search_result(text)
-                    or self._has_many_urls(text)
-                    or len(text) > 5000
-                )
-                if not is_search:
-                    continue
-
-                logger.info(f"[搜索优化器] 发现搜索内容: {tool_name} ({len(text)} 字符)")
-                source_urls = self._extract_urls(text)
-                cleaned = self._strip_noise(text)
-                if not cleaned:
-                    continue
-
-                if self.preprocess_provider_id:
-                    summary = await self._llm_preprocess(tool_name, {}, cleaned, source_urls)
-                else:
-                    summary = self._rule_extract(tool_name, {}, cleaned, source_urls)
-
-                if summary and len(summary) < len(text):
-                    # 标记已压缩
-                    summary = f"<compressed>\n{summary}"
-                    self._replace_content(msg, content, summary)
-                    saved = len(text) - len(summary)
-                    self._total_chars_saved += saved
-                    self._preprocess_count += 1
-                    mode = 'LLM' if self.preprocess_provider_id else '规则'
-                    logger.info(
-                        f"[搜索优化器] [{mode}] {len(text)}→{len(summary)} "
-                        f"(省 {saved}，累计 {self._total_chars_saved})"
-                    )
-                    # 缓存，供下次命中
-                    if self.optimize_search:
-                        self._cache_set(tool_name, summary)
-
-        except Exception as e:
-            logger.error(f"[搜索优化器] on_agent_done 失败: {e}")
-
-    # ══════════════════════════════════════════════════════════
-    # 钩子：on_llm_request（缓存注入，命中缓存时跳过搜索）
+    # 钩子：缓存注入
     # ══════════════════════════════════════════════════════════
 
     @filter.on_llm_request()
-    async def on_llm_request(
-        self, event: AstrMessageEvent, req: ProviderRequest
-    ):
-        if self.optimize_search:
-            await self._inject_cache(req)
-
-    def _has_many_urls(self, text: str, min_count: int = 3) -> bool:
-        """判断文本是否包含大量 URL。"""
-        urls = re.findall(r'https?://[^\s<>\]\)\"\']+', text)
-        return len(set(urls)) >= min_count
-
-    async def _inject_cache(self, req: ProviderRequest):
-        """缓存命中时注入预处理结果。"""
+    async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
+        if not self.optimize_search:
+            return
         user_msg = self._get_user_message(req)
         if not user_msg or len(user_msg) < 5:
             return
@@ -328,48 +692,34 @@ class SearchOptimizerPlugin(Star):
         if not cached:
             return
         self._cache_hits += 1
-        logger.info(
-            f"[搜索优化器] 缓存命中 (累计 {self._cache_hits}): {user_msg[:30]}..."
-        )
+        logger.info(f"[搜索优化器] 缓存命中 (累计 {self._cache_hits}): {user_msg[:30]}...")
 
-        # 注入时明确告诉 LLM 不要再搜索
-        if self.small_model_answer and self.preprocess_provider_id:
-            answer = await self._small_model_answer(user_msg, cached)
-            if answer:
-                try:
-                    from astrbot.core.agent.message import TextPart
-                    inject_text = (
+        try:
+            from astrbot.core.agent.message import TextPart
+            if self.small_model_answer and self.preprocess_provider_id:
+                answer = await self._small_model_answer(user_msg, cached)
+                if answer:
+                    inject = (
                         f"<cached_answer>\n"
-                        f"以下是根据之前搜索结果生成的回答，直接输出即可。"
+                        f"以下是根据搜索结果生成的回答，直接输出即可。"
                         f"已有足够信息，无需调用 web_search 或 web_fetch。\n\n"
                         f"{answer}\n"
                         f"</cached_answer>"
                     )
-                    if hasattr(req, "extra_user_content_parts"):
-                        req.extra_user_content_parts.append(
-                            TextPart(text=inject_text).mark_as_temp()
-                        )
+                    req.extra_user_content_parts.append(TextPart(text=inject).mark_as_temp())
                     logger.info(f"[搜索优化器] 小模型已生成答案 ({len(answer)} 字符)")
-                except Exception as e:
-                    logger.warning(f"[搜索优化器] 注入答案失败: {e}")
-            return
+                return
 
-        # 普通模式：注入缓存 + 告诉 LLM 不要重复搜索
-        try:
-            from astrbot.core.agent.message import TextPart
-            inject_text = (
+            inject = (
                 f"<cached_search_results>\n"
                 f"以下是之前搜索「{user_msg[:50]}」的预处理结果。"
                 f"已有足够信息回答此问题，无需调用 web_search 或 web_fetch。"
                 f"请直接基于以下内容回答：\n\n{cached}\n"
                 f"</cached_search_results>"
             )
-            if hasattr(req, "extra_user_content_parts"):
-                req.extra_user_content_parts.append(
-                    TextPart(text=inject_text).mark_as_temp()
-                )
+            req.extra_user_content_parts.append(TextPart(text=inject).mark_as_temp())
         except Exception as e:
-            logger.warning(f"[搜索优化器] 注入缓存失败: {e}")
+            logger.warning(f"[搜索优化器] 注入失败: {e}")
 
     def _get_user_message(self, req: ProviderRequest) -> str:
         try:
@@ -388,17 +738,14 @@ class SearchOptimizerPlugin(Star):
         return ""
 
     async def _small_model_answer(self, user_msg: str, cached: str) -> Optional[str]:
-        """用小模型直接生成最终回答（不经过主力模型）。"""
         prompt = (
             f"用户问题：{user_msg}\n\n"
-            f"以下是相关的搜索结果摘要：\n{cached}\n\n"
-            f"请根据以上搜索结果，用简洁的中文回答用户的问题。"
-            f"如果搜索结果中没有相关信息，请说明。"
+            f"搜索结果摘要：\n{cached}\n\n"
+            f"请根据搜索结果回答用户问题。如果搜索结果中没有相关信息，请说明。"
         )
         try:
             resp = await self.context.llm_generate(
-                chat_provider_id=self.preprocess_provider_id,
-                prompt=prompt,
+                chat_provider_id=self.preprocess_provider_id, prompt=prompt,
             )
             return resp.completion_text
         except Exception as e:
@@ -406,113 +753,65 @@ class SearchOptimizerPlugin(Star):
             return None
 
     # ══════════════════════════════════════════════════════════
-    # 钩子：拦截工具返回结果（支持多 URL 并行处理）
+    # 钩子：on_agent_done（兜底，处理其他来源的搜索结果）
     # ══════════════════════════════════════════════════════════
 
-    @filter.on_llm_tool_respond()
-    async def on_tool_respond(
-        self, event: AstrMessageEvent, tool,
-        tool_args: dict | None, tool_result,
-    ):
-        tool_name = getattr(tool, "name", "")
-        if not _is_search_tool(tool_name):
-            return
+    @filter.on_agent_done()
+    async def on_agent_done(self, event, run_context, resp):
+        """兜底：扫描对话中的搜索结果，预处理并缓存。"""
         try:
-            await self._process_tool_result(
-                event, tool_name, tool_args, tool_result
-            )
+            ctx = run_context
+            messages = None
+            for attr in ('messages', 'conversation_context', 'history', 'contexts'):
+                messages = getattr(ctx, attr, None)
+                if messages and isinstance(messages, list):
+                    break
+            if not messages:
+                inner = getattr(ctx, 'context', None)
+                if inner:
+                    for attr in ('messages', 'conversation_context', 'history'):
+                        messages = getattr(inner, attr, None)
+                        if messages and isinstance(messages, list):
+                            break
+            if not messages:
+                return
+            for msg in messages:
+                role = getattr(msg, 'role', None)
+                if role not in ('tool', 'function'):
+                    continue
+                tool_name = getattr(msg, 'name', '') or ''
+                content = getattr(msg, 'content', None)
+                text = self._extract_text(content)
+                if not text or len(text) < 2000 or '<compressed>' in text:
+                    continue
+                is_search = (
+                    _is_search_tool(tool_name)
+                    or _is_json_search_result(text)
+                    or len(text) > 5000
+                )
+                if not is_search:
+                    continue
+                logger.info(f"[搜索优化器] 兜底处理: {tool_name} ({len(text)} 字符)")
+                source_urls = self._extract_urls(text)
+                cleaned = self._strip_noise(text)
+                if not cleaned:
+                    continue
+                if self.preprocess_provider_id:
+                    summary = await self._llm_preprocess(tool_name, {}, cleaned, source_urls)
+                else:
+                    summary = self._rule_extract(tool_name, {}, cleaned, source_urls)
+                if summary and len(summary) < len(text):
+                    summary = f"<compressed>\n{summary}"
+                    self._replace_content(msg, content, summary)
+                    saved = len(text) - len(summary)
+                    self._total_chars_saved += saved
+                    self._preprocess_count += 1
+                    logger.info(f"[搜索优化器] 兜底压缩: {len(text)}→{len(summary)} (省 {saved})")
         except Exception as e:
-            logger.error(f"[搜索优化器] 处理 {tool_name} 失败: {e}")
-
-    async def _process_tool_result(
-        self, event, tool_name, tool_args, tool_result
-    ):
-        if not tool_result or not hasattr(tool_result, "content"):
-            return
-
-        # 收集需要处理的 items
-        pending = []
-        for item in tool_result.content:
-            text = getattr(item, "text", None)
-            if text and len(text) >= 2000:
-                pending.append((item, text))
-
-        if not pending:
-            return
-
-        source_urls = self._extract_urls_from_args(tool_args) or (
-            self._extract_urls(pending[0][1]) if pending else []
-        )
-
-        # 并行预处理所有 items
-        async def _process_one(item, text):
-            original_len = len(text)
-            logger.info(f"[搜索优化器] 拦截 {tool_name} ({original_len} 字符)")
-            cleaned = self._strip_noise(text)
-            if not cleaned:
-                return None, None
-            if self.preprocess_provider_id:
-                summary = await self._llm_preprocess(
-                    tool_name, tool_args, cleaned, source_urls
-                )
-            else:
-                summary = self._rule_extract(
-                    tool_name, tool_args, cleaned, source_urls
-                )
-            return item, (original_len, summary)
-
-        # 并行执行
-        results = await asyncio.gather(
-            *[_process_one(item, text) for item, text in pending],
-            return_exceptions=True,
-        )
-
-        for result in results:
-            if isinstance(result, Exception):
-                logger.error(f"[搜索优化器] 并行处理异常: {result}")
-                continue
-            item, data = result
-            if not item or not data:
-                continue
-            original_len, summary = data
-            if summary and len(summary) < original_len:
-                item.text = summary
-                saved = original_len - len(summary)
-                self._total_chars_saved += saved
-                self._preprocess_count += 1
-                mode = "LLM" if self.preprocess_provider_id else "规则"
-                logger.info(
-                    f"[搜索优化器] [{mode}] {original_len}→{len(summary)} "
-                    f"(省 {saved}，累计 {self._total_chars_saved})"
-                )
-                if self.optimize_search:
-                    cache_key = self._extract_search_query(tool_args)
-                    if cache_key:
-                        self._cache_set(cache_key, summary)
-
-    def _extract_search_query(self, tool_args: dict | None) -> str:
-        if not tool_args:
-            return ""
-        for key in ("keywords", "query", "q", "keyword"):
-            val = tool_args.get(key)
-            if val:
-                if isinstance(val, list):
-                    return " ".join(str(v) for v in val)
-                return str(val)
-        return ""
-
-    def _extract_urls_from_args(self, tool_args: dict | None) -> list[str]:
-        if not tool_args:
-            return []
-        urls = tool_args.get("urls", tool_args.get("url", []))
-        if isinstance(urls, str):
-            urls = [urls]
-        if isinstance(urls, list):
-            return [str(u) for u in urls if u]
-        return []
+            logger.error(f"[搜索优化器] on_agent_done 失败: {e}")
 
     # ══════════════════════════════════════════════════════════
-    # 统一去噪
+    # 去噪 + 规则提取 + LLM 压缩（与之前版本相同）
     # ══════════════════════════════════════════════════════════
 
     def _strip_noise(self, text: str) -> str:
@@ -535,18 +834,11 @@ class SearchOptimizerPlugin(Star):
         text = text.strip()
         return text if len(text) >= 50 else ""
 
-    # ══════════════════════════════════════════════════════════
-    # LLM 预处理
-    # ══════════════════════════════════════════════════════════
-
-    async def _llm_preprocess(
-        self, tool_name, tool_args, content, source_urls
-    ) -> Optional[str]:
+    async def _llm_preprocess(self, tool_name, tool_args, content, source_urls):
         prompt = self._build_prompt(tool_name, tool_args, content)
         try:
             resp = await self.context.llm_generate(
-                chat_provider_id=self.preprocess_provider_id,
-                prompt=prompt,
+                chat_provider_id=self.preprocess_provider_id, prompt=prompt,
             )
             result = resp.completion_text
             if not result:
@@ -567,17 +859,15 @@ class SearchOptimizerPlugin(Star):
         else:
             p = "从以下内容中提取关键信息，输出精炼摘要。"
         parts = [p]
-        if tool_args:
+        if isinstance(tool_args, dict):
             for k in ("keywords", "query", "urls", "url"):
                 if k in tool_args:
                     parts.append(f"\n{k}: {tool_args[k]}")
+        elif isinstance(tool_args, list):
+            parts.append(f"\n关键词: {', '.join(str(a) for a in tool_args)}")
         parts.append(f"\n--- 原始内容 ---\n{content}")
         parts.append(f"\n--- 输出摘要（≤{self.max_summary_chars} 字符）---")
         return "\n".join(parts)
-
-    # ══════════════════════════════════════════════════════════
-    # 规则提取
-    # ══════════════════════════════════════════════════════════
 
     def _rule_extract(self, tool_name, tool_args, content, source_urls=None):
         s = content.strip()
@@ -705,39 +995,26 @@ class SearchOptimizerPlugin(Star):
             r'(?:ICP备|备案号|公安备).*?\n',
         ]:
             text = re.sub(p, '', text, flags=re.IGNORECASE)
-
-        # ── Wiki/Fandom 内容优化 ──
-        # 去除 wiki 标记和模板噪音
+        # Wiki/Fandom 噪音
         wiki_noise = [
-            r'\{\{[^}]*\}\}',             # {{模板}}
-            r'\[\[Category:[^\]]*\]\]',    # [[Category:...]]
-            r'\[\[File:[^\]]*\]\]',        # [[File:...]]
-            r'\[\[Image:[^\]]*\]\]',       # [[Image:...]]
-            r'<ref[^>]*>.*?</ref>',           # <ref>引用</ref>
-            r'<ref[^>]*/>',                   # <ref ... />
-            r'</?nowiki>',                    # <nowiki> 标记
-            r'\{\|[^|]*\|}',               # 表格标记
-            r'^\s*\|.*$',                    # 表格行
-            r'^\s*!\s.*$',                   # 表格标题行
-            r'↑.*?引用.*?$',                  # 引用标记行
+            r'\{\{[^}]*\}\}', r'\[\[Category:[^\]]*\]\]',
+            r'\[\[File:[^\]]*\]\]', r'\[\[Image:[^\]]*\]\]',
+            r'<ref[^>]*>.*?</ref>', r'<ref[^>]*/>',
+            r'</?nowiki>', r'\{\|[^|]*\|}',
+            r'^\s*\|.*$', r'^\s*!\s.*$',
         ]
         for pat in wiki_noise:
             text = re.sub(pat, '', text, flags=re.IGNORECASE | re.MULTILINE)
-
-        # 简化 wiki 链接：[[显示文本|链接文本]] → 显示文本
-        text = re.sub(r'\[\[([^|\]]*?)\]\]', r'\1', text)
-        text = re.sub(r'\[\[[^|]*?\|([^\]]*?)\]\]', r'\1', text)
-
-        # 去除短行（通常是导航、菜单、按钮文字）
+        text = re.sub(r'\[\[([^\]|]*?)\]\]', r'\1', text)
+        text = re.sub(r'\[\[[^\|]*?\|([^\]]*?)\]\]', r'\1', text)
         lines = text.split('\n')
         filtered = []
         for line in lines:
             s = line.strip()
             if not s:
                 filtered.append('')
-            elif len(s) > 15 or any(c in s for c in '。，、；：！？'):
+            elif len(s) > 15 or any(c in s for c in '。，、；！？'):
                 filtered.append(line)
-
         return '\n'.join(filtered).strip()
 
     def _smart_truncate(self, text, max_chars):
@@ -761,48 +1038,57 @@ class SearchOptimizerPlugin(Star):
                 out.append(u)
         return out
 
+    def _extract_text(self, content):
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            texts = []
+            for item in content:
+                if hasattr(item, "text"):
+                    texts.append(item.text)
+                elif isinstance(item, str):
+                    texts.append(item)
+            return "\n".join(texts) if texts else None
+        return None
+
+    def _replace_content(self, msg, content, new_text):
+        if isinstance(content, str):
+            msg.content = new_text
+        elif isinstance(content, list):
+            for item in content:
+                if hasattr(item, "text"):
+                    item.text = new_text
+                    break
+
     # ══════════════════════════════════════════════════════════
-    # 指令：/搜索优化器
+    # 指令
     # ══════════════════════════════════════════════════════════
 
     @filter.command("搜索优化器")
     async def cmd_status(self, event: AstrMessageEvent):
-        """查看运行统计"""
         model = "规则提取"
         if self.preprocess_provider_id:
-            model = await self._get_provider_display_name(
-                self.preprocess_provider_id
-            ) or self.preprocess_provider_id
-
+            model = await self._get_provider_display_name(self.preprocess_provider_id) or self.preprocess_provider_id
         cache_count = len(self._cache)
-
-        # 计算压缩率
         ratio = "-"
         if self._preprocess_count > 0 and self._total_chars_saved > 0:
-            # 估算平均压缩率
-            avg_saved = self._total_chars_saved / self._preprocess_count
-            ratio = f"~{avg_saved / (avg_saved + self.max_summary_chars) * 100:.0f}%"
-
-        # 估算节省 Token（中文约 1.5 字符 = 1 Token）
-        tokens_saved = self._total_chars_saved // 1.5 if self._total_chars_saved > 0 else 0
-
-        # 缓存命中率
+            avg = self._total_chars_saved / self._preprocess_count
+            ratio = f"~{avg / (avg + self.max_summary_chars) * 100:.0f}%"
+        tokens_saved = self._total_chars_saved / 1.5 if self._total_chars_saved > 0 else 0
         total_queries = self._cache_hits + self._preprocess_count
         hit_rate = f"{self._cache_hits / total_queries * 100:.0f}%" if total_queries > 0 else "-"
-
-        # 模式描述
         if self.small_model_answer and self.preprocess_provider_id:
             mode_desc = "小模型直接回答"
         elif self.preprocess_provider_id:
             mode_desc = "LLM 摘要压缩"
         else:
             mode_desc = "规则提取（零 LLM）"
-
         lines = [
             "📊 搜索结果优化器",
             "─" * 24,
             f"模式: {mode_desc}",
             f"模型: {model}",
+            f"搜索功能: {'✅ 内置' if self._tools_registered else '✅ 依赖外部插件' if _BING_AVAILABLE else '❌ 不可用'}",
             f"摘要上限: {self.max_summary_chars} 字符",
             "─" * 24,
             f"优化搜索: {'✅' if self.optimize_search else '❌'}",
@@ -819,7 +1105,6 @@ class SearchOptimizerPlugin(Star):
 
     @filter.command("清除缓存")
     async def cmd_clear_cache(self, event: AstrMessageEvent):
-        """清空搜索优化器缓存"""
         count = self._cache_clear()
         yield event.plain_result(f"✅ 已清除 {count} 条缓存")
 
