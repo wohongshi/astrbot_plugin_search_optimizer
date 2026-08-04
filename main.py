@@ -1,11 +1,12 @@
 """
-AstrBot 搜索结果优化器 v6
+AstrBot 搜索结果优化器 v7
 功能：
 1. 内置 web_search + web_fetch 工具（自包含，无需额外插件）
-2. 拦截搜索/抓取工具结果，用低成本模型或规则提取压缩内容
+2. 两阶段压缩：规则提取 → 小模型精简（可选）
 3. 缓存预处理结果，命中缓存时跳过搜索，直接注入上下文
 4. LRU 缓存淘汰，防止缓存无限增长
-5. 多 URL 并行预处理
+5. 搜索结果相关性检测，自动去虚词重搜
+6. 多 URL 并行预处理
 """
 
 import asyncio
@@ -22,7 +23,6 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 
-# 内置工具
 from .tools.bing_search import BingSearchTool
 from .tools.web_fetch import WebFetchTool
 
@@ -55,7 +55,6 @@ def _is_json_search_result(text: str) -> bool:
     return False
 
 
-# 时间敏感词：包含这些词的查询会把当天日期混入缓存 key
 _TIME_KEYWORDS = (
     "今天", "今日", "今晚", "今晨", "今早",
     "昨天", "昨日", "昨晚", "前天", "前日", "前晚",
@@ -80,7 +79,6 @@ _TIME_KEYWORDS = (
 
 
 def _normalize_query(text: str) -> str:
-    """归一化搜索关键词，包含时间敏感词时混入当天日期。"""
     t = text.lower().strip()
     t = re.sub(r'\s+', ' ', t)
     t = re.sub(r'[，。、；：！？,.;:?\-\[\]\(\)\{\}\"\'<>]', '', t)
@@ -92,20 +90,18 @@ def _normalize_query(text: str) -> str:
 
 
 class SearchOptimizerPlugin(Star):
-    """搜索结果优化器：内置搜索/抓取工具 + 压缩搜索结果 + 缓存加速。"""
+    """搜索结果优化器：内置搜索/抓取工具 + 两阶段压缩 + 缓存加速。"""
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
         self._load_config()
 
-        # 统计
         self._total_chars_saved = 0
         self._preprocess_count = 0
         self._cache_hits = 0
         self._cache_dirty = False
 
-        # 缓存
         from astrbot.core.utils.astrbot_path import get_astrbot_data_path
         self._cache_dir = str(
             Path(get_astrbot_data_path()) / "plugin_data" / "search_optimizer"
@@ -116,7 +112,6 @@ class SearchOptimizerPlugin(Star):
         self._clean_expired_cache()
         self._evict_lru()
 
-        # ── 注册内置 LLM 工具 ──
         search_timeout = self.config.get("search_timeout", 30)
         try:
             self.context.add_llm_tools(
@@ -129,6 +124,8 @@ class SearchOptimizerPlugin(Star):
 
         if not self.preprocess_provider_id:
             logger.info("[搜索优化器] 未配置预处理模型，使用规则提取模式")
+        else:
+            logger.info(f"[搜索优化器] 预处理模型: {self.preprocess_provider_id}")
 
     def _load_config(self):
         self.preprocess_provider_id = self.config.get("preprocess_provider_id", "")
@@ -176,7 +173,6 @@ class SearchOptimizerPlugin(Star):
             logger.info(f"[搜索优化器] 清理 {len(expired)} 条过期缓存")
 
     def _evict_lru(self):
-        """LRU 淘汰：缓存条数超限时，删除命中次数最少 + 最久未用的条目。"""
         if len(self._cache) <= self.max_cache_entries:
             return
         sorted_keys = sorted(
@@ -197,7 +193,6 @@ class SearchOptimizerPlugin(Star):
         key = _normalize_query(query)
         entry = self._cache.get(key)
         if not entry:
-            # 模糊匹配
             q_words = set(key.split())
             for cached_key, cached_entry in self._cache.items():
                 c_words = set(cached_key.split())
@@ -232,7 +227,6 @@ class SearchOptimizerPlugin(Star):
         self._evict_lru()
 
     def _cache_clear(self):
-        """清空全部缓存。"""
         count = len(self._cache)
         self._cache.clear()
         self._cache_dirty = True
@@ -240,12 +234,11 @@ class SearchOptimizerPlugin(Star):
         return count
 
     # ══════════════════════════════════════════════════════════
-    # 钩子：on_agent_done（agent 运行完成后触发，扫描工具结果）
+    # 钩子：on_agent_done
     # ══════════════════════════════════════════════════════════
 
     @filter.on_agent_done()
     async def on_agent_done(self, event, run_context, resp):
-        """agent 运行完成后，扫描对话中的工具结果，预处理并缓存。"""
         try:
             messages = None
             ctx = run_context
@@ -294,7 +287,7 @@ class SearchOptimizerPlugin(Star):
                 summary = self._rule_extract(tool_name, {}, cleaned, source_urls)
                 mode = '规则'
 
-                # 第二阶段：小模型进一步压缩
+                # 第二阶段：小模型精简
                 if summary and self.preprocess_provider_id:
                     llm_result = await self._llm_preprocess(tool_name, {}, summary, source_urls)
                     if llm_result and len(llm_result) < len(summary):
@@ -318,7 +311,7 @@ class SearchOptimizerPlugin(Star):
             logger.error(f"[搜索优化器] on_agent_done 失败: {e}")
 
     # ══════════════════════════════════════════════════════════
-    # 钩子：on_llm_request（缓存注入，命中缓存时跳过搜索）
+    # 钩子：on_llm_request（缓存注入）
     # ══════════════════════════════════════════════════════════
 
     @filter.on_llm_request()
@@ -333,7 +326,6 @@ class SearchOptimizerPlugin(Star):
         return len(set(urls)) >= min_count
 
     async def _inject_cache(self, req: ProviderRequest):
-        """缓存命中时注入预处理结果。"""
         user_msg = self._get_user_message(req)
         if not user_msg or len(user_msg) < 5:
             return
@@ -399,7 +391,7 @@ class SearchOptimizerPlugin(Star):
         return ""
 
     async def _small_model_answer(self, user_msg: str, cached: str) -> Optional[str]:
-        """用小模型直接生成最终回答（不经过主力模型）。"""
+        """用小模型直接生成回答（不使用人格配置）。"""
         prompt = (
             f"用户问题：{user_msg}\n\n"
             f"以下是相关的搜索结果摘要：\n{cached}\n\n"
@@ -410,6 +402,7 @@ class SearchOptimizerPlugin(Star):
             resp = await self.context.llm_generate(
                 chat_provider_id=self.preprocess_provider_id,
                 prompt=prompt,
+                system_prompt="",  # 不使用人格配置
             )
             return resp.completion_text
         except Exception as e:
@@ -417,7 +410,7 @@ class SearchOptimizerPlugin(Star):
             return None
 
     # ══════════════════════════════════════════════════════════
-    # 钩子：拦截工具返回结果（支持多 URL 并行处理）
+    # 钩子：拦截工具返回结果
     # ══════════════════════════════════════════════════════════
 
     @filter.on_llm_tool_respond()
@@ -464,7 +457,7 @@ class SearchOptimizerPlugin(Star):
             summary = self._rule_extract(
                 tool_name, tool_args, cleaned, source_urls
             )
-            # 第二阶段：小模型进一步压缩
+            # 第二阶段：小模型精简
             if summary and self.preprocess_provider_id:
                 llm_result = await self._llm_preprocess(
                     tool_name, tool_args, summary, source_urls
@@ -547,7 +540,7 @@ class SearchOptimizerPlugin(Star):
         return text if len(text) >= 50 else ""
 
     # ══════════════════════════════════════════════════════════
-    # LLM 预处理
+    # LLM 预处理（不使用人格配置）
     # ══════════════════════════════════════════════════════════
 
     async def _llm_preprocess(
@@ -558,6 +551,7 @@ class SearchOptimizerPlugin(Star):
             resp = await self.context.llm_generate(
                 chat_provider_id=self.preprocess_provider_id,
                 prompt=prompt,
+                system_prompt="",  # 不使用人格配置，避免小模型输出异常
             )
             result = resp.completion_text
             if not result:
@@ -738,7 +732,6 @@ class SearchOptimizerPlugin(Star):
         return out
 
     def _extract_text(self, content) -> str:
-        """从工具返回内容中提取纯文本。"""
         if isinstance(content, str):
             return content
         if isinstance(content, list):
@@ -752,7 +745,6 @@ class SearchOptimizerPlugin(Star):
         return ""
 
     def _replace_content(self, msg, old_content, new_text):
-        """替换消息中的工具返回内容。"""
         if isinstance(old_content, str):
             msg.content = new_text
         elif isinstance(old_content, list):
@@ -762,12 +754,12 @@ class SearchOptimizerPlugin(Star):
                     break
 
     # ══════════════════════════════════════════════════════════
-    # 指令：/搜索优化器
+    # 指令（需要管理员权限）
     # ══════════════════════════════════════════════════════════
 
-    @filter.command("搜索优化器")
+    @filter.command("搜索优化器", require_admin=True)
     async def cmd_status(self, event: AstrMessageEvent):
-        """查看运行统计"""
+        """查看运行统计（管理员）"""
         model = "规则提取"
         if self.preprocess_provider_id:
             model = await self._get_provider_display_name(
@@ -812,11 +804,42 @@ class SearchOptimizerPlugin(Star):
         ]
         yield event.plain_result("\n".join(lines))
 
-    @filter.command("清除缓存")
+    @filter.command("清除缓存", require_admin=True)
     async def cmd_clear_cache(self, event: AstrMessageEvent):
-        """清空搜索优化器缓存"""
+        """清空搜索优化器缓存（管理员）"""
         count = self._cache_clear()
         yield event.plain_result(f"✅ 已清除 {count} 条缓存")
+
+    @filter.command("优化开启", require_admin=True)
+    async def cmd_enable_optimize(self, event: AstrMessageEvent):
+        """开启优化搜索（管理员）"""
+        self.optimize_search = True
+        self.config["optimize_search"] = True
+        yield event.plain_result("✅ 优化搜索已开启")
+
+    @filter.command("优化关闭", require_admin=True)
+    async def cmd_disable_optimize(self, event: AstrMessageEvent):
+        """关闭优化搜索（管理员）"""
+        self.optimize_search = False
+        self.config["optimize_search"] = False
+        yield event.plain_result("✅ 优化搜索已关闭")
+
+    @filter.command("小模型开启", require_admin=True)
+    async def cmd_enable_small_model(self, event: AstrMessageEvent):
+        """开启小模型直接回答（管理员）"""
+        if not self.preprocess_provider_id:
+            yield event.plain_result("❌ 未配置预处理模型，请先在 WebUI 配置")
+            return
+        self.small_model_answer = True
+        self.config["small_model_answer"] = True
+        yield event.plain_result("✅ 小模型直接回答已开启")
+
+    @filter.command("小模型关闭", require_admin=True)
+    async def cmd_disable_small_model(self, event: AstrMessageEvent):
+        """关闭小模型直接回答（管理员）"""
+        self.small_model_answer = False
+        self.config["small_model_answer"] = False
+        yield event.plain_result("✅ 小模型直接回答已关闭")
 
     # ══════════════════════════════════════════════════════════
     # Provider 辅助
@@ -856,7 +879,6 @@ class SearchOptimizerPlugin(Star):
 
     async def terminate(self):
         self._save_cache(force=True)
-        # 关闭共享 HTTP 连接池
         from .tools.bing_search import close_session as close_bing
         from .tools.web_fetch import close_session as close_fetch
         await close_bing()
