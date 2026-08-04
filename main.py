@@ -718,7 +718,8 @@ class SearchOptimizerPlugin(Star):
                         f"{answer}\n"
                         f"</cached_answer>"
                     )
-                    req.extra_user_content_parts.append(TextPart(text=inject).mark_as_temp())
+                    if hasattr(req, 'extra_user_content_parts'):
+                        req.extra_user_content_parts.append(TextPart(text=inject).mark_as_temp())
                     logger.info(f"[搜索优化器] 小模型已生成答案 ({len(answer)} 字符)")
                 return
 
@@ -729,7 +730,8 @@ class SearchOptimizerPlugin(Star):
                 f"请直接基于以下内容回答：\n\n{cached}\n"
                 f"</cached_search_results>"
             )
-            req.extra_user_content_parts.append(TextPart(text=inject).mark_as_temp())
+            if hasattr(req, 'extra_user_content_parts'):
+                req.extra_user_content_parts.append(TextPart(text=inject).mark_as_temp())
         except Exception as e:
             logger.warning(f"[搜索优化器] 注入失败: {e}")
 
