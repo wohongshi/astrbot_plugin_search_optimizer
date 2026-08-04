@@ -30,6 +30,13 @@
     "default": 1500,
     "hint": "控制摘要长度。值越大保留信息越多，但 Token 消耗也越多。"
   },
+  "browser": {
+    "description": "浏览器选择",
+    "type": "string",
+    "default": "auto",
+    "options": ["auto", "chromium", "chrome", "edge"],
+    "hint": "auto=自动检测，chromium=/usr/bin/chromium，chrome=/usr/bin/google-chrome，edge=/usr/bin/microsoft-edge"
+  },
   "small_model_answer": {
     "description": "小模型直接回答（命中缓存时用小模型回答，不消耗主力模型 Token）",
     "type": "bool",

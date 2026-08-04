@@ -23,6 +23,7 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 _BING_AVAILABLE = False
 _search_bing = None
 _fetch_page = None
+_BROWSER_CHOICE = "auto"  # 由插件初始化时设置
 
 try:
     # 尝试从已安装的 Bing 插件导入
@@ -80,9 +81,15 @@ if not _BING_AVAILABLE:
                 return port
 
         @lru_cache(maxsize=1)
-        def _find_browser_path() -> str:
+        def _find_browser_path(browser_choice: str = "auto") -> str:
             system = platform.system()
-            if system == "Windows":
+            if browser_choice == "chromium":
+                candidates = ["/usr/bin/chromium", "/usr/bin/chromium-browser"]
+            elif browser_choice == "chrome":
+                candidates = ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"]
+            elif browser_choice == "edge":
+                candidates = ["/usr/bin/microsoft-edge", "/usr/bin/microsoft-edge-stable"]
+            elif system == "Windows":
                 candidates = [
                     "C:/Program Files/Google/Chrome/Application/chrome.exe",
                     "C:/Program Files (x86)/Google/Chrome/Application/chrome.exe",
@@ -106,7 +113,7 @@ if not _BING_AVAILABLE:
             for p in candidates:
                 if os.path.exists(p):
                     return p
-            raise FileNotFoundError("未找到浏览器，请安装 Chromium/Chrome")
+            raise FileNotFoundError("未找到浏览器，请安装 Chromium/Chrome/Edge")
 
         _MAX_CONCURRENT = 4
         _browser_semaphore = threading.Semaphore(_MAX_CONCURRENT)
@@ -122,7 +129,7 @@ if not _BING_AVAILABLE:
                 user_data_dir = None
                 port = _alloc_port()
                 co = ChromiumOptions()
-                co.set_browser_path(_find_browser_path())
+                co.set_browser_path(_find_browser_path(_BROWSER_CHOICE))
                 co.set_argument("--disable-blink-features=AutomationControlled")
                 co.set_argument("--no-sandbox")
                 co.set_argument("--remote-debugging-port=0")
@@ -237,7 +244,7 @@ if not _BING_AVAILABLE:
                     try:
                         port = _alloc_port()
                         co = ChromiumOptions()
-                        co.set_browser_path(_find_browser_path())
+                        co.set_browser_path(_find_browser_path(_BROWSER_CHOICE))
                         co.set_argument("--disable-blink-features=AutomationControlled")
                         co.set_argument("--no-sandbox")
                         co.set_argument("--remote-debugging-port=0")
@@ -505,6 +512,10 @@ class SearchOptimizerPlugin(Star):
         self._clean_expired_cache()
         self._evict_lru()
 
+        # 设置浏览器选择
+        global _BROWSER_CHOICE
+        _BROWSER_CHOICE = self.browser
+
         # 注册优化版搜索工具
         self._tools_registered = False
         if _TOOLS_AVAILABLE and _BING_AVAILABLE:
@@ -523,6 +534,7 @@ class SearchOptimizerPlugin(Star):
         self.max_cache_entries = self.config.get("max_cache_entries", 200)
         self.max_summary_chars = self.config.get("max_summary_chars", 1500)
         self.small_model_answer = self.config.get("small_model_answer", False)
+        self.browser = self.config.get("browser", "auto")
 
     def _register_tools(self):
         """注册优化版搜索工具，替换原始工具。"""
