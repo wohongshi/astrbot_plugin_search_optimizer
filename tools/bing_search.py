@@ -1,4 +1,4 @@
-"""Bing 搜索工具 — 异步 aiohttp 实现，带连接复用和结果缓存"""
+"""Bing 搜索工具 — 搜索 + 自动抓取详情页，带连接复用和结果缓存"""
 
 import asyncio
 import json
@@ -27,9 +27,17 @@ _USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 ]
 
-# ── 搜索结果短期缓存（5 分钟） ──
+# 搜索结果短期缓存（5 分钟）
 _search_cache: dict[str, tuple[float, str]] = {}
-_CACHE_TTL = 300  # 秒
+_CACHE_TTL = 300
+
+# 不抓取详情的域名（视频、社交、登录墙等）
+_SKIP_DETAIL_DOMAINS = {
+    "youtube.com", "bilibili.com", "tiktok.com", "douyin.com",
+    "weibo.com", "twitter.com", "x.com", "facebook.com",
+    "instagram.com", "reddit.com", "zhihu.com",
+    "v.qq.com", "iqiyi.com", "youku.com",
+}
 
 
 def _cache_get(key: str) -> str | None:
@@ -42,7 +50,6 @@ def _cache_get(key: str) -> str | None:
 
 
 def _cache_set(key: str, value: str):
-    # 防止缓存无限增长
     if len(_search_cache) > 100:
         oldest = sorted(_search_cache.keys(), key=lambda k: _search_cache[k][0])
         for k in oldest[:30]:
@@ -50,7 +57,7 @@ def _cache_set(key: str, value: str):
     _search_cache[key] = (time.time(), value)
 
 
-# ── 共享 Session（连接复用） ──
+# ── 共享 Session ──
 _session: aiohttp.ClientSession | None = None
 _session_lock = asyncio.Lock()
 
@@ -65,7 +72,6 @@ async def _get_session() -> aiohttp.ClientSession:
 
 
 async def close_session():
-    """插件卸载时调用，关闭连接池。"""
     global _session
     async with _session_lock:
         if _session and not _session.closed:
@@ -73,12 +79,129 @@ async def close_session():
         _session = None
 
 
+def _should_fetch_detail(url: str) -> bool:
+    """判断是否值得抓取详情页。"""
+    try:
+        domain = urlparse(url).netloc.lower().replace("www.", "")
+        for skip in _SKIP_DETAIL_DOMAINS:
+            if skip in domain:
+                return False
+    except Exception:
+        return False
+    return True
+
+
+async def _fetch_detail(url: str, max_chars: int = 3000) -> str:
+    """抓取详情页正文，双引擎：aiohttp + Playwright 兜底。"""
+    # 先用 aiohttp 快速抓取
+    text = await _fetch_detail_aiohttp(url, max_chars)
+    if text and len(text) > 200 and "Loading" not in text[:100]:
+        return text
+
+    # 内容不足，用 Playwright 渲染
+    pw_text = await _fetch_detail_playwright(url, max_chars)
+    if pw_text and len(pw_text) > len(text or ""):
+        return pw_text
+
+    return text or ""
+
+
+async def _fetch_detail_aiohttp(url: str, max_chars: int) -> str:
+    """aiohttp 快速抓取详情。"""
+    try:
+        import trafilatura
+        session = await _get_session()
+        headers = {
+            "User-Agent": random.choice(_USER_AGENTS),
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        }
+        async with session.get(
+            url, headers=headers,
+            timeout=aiohttp.ClientTimeout(total=15),
+            allow_redirects=True,
+        ) as resp:
+            if resp.status != 200:
+                return ""
+            html = await resp.text(errors="replace")
+
+        extracted = trafilatura.extract(
+            html, include_comments=False, include_tables=True, url=url
+        )
+        if extracted:
+            text = extracted.strip()
+        else:
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup(["script", "style", "nav", "header", "footer", "aside"]):
+                tag.decompose()
+            text = soup.get_text(separator="\n", strip=True)
+            text = re.sub(r"\n\s*\n", "\n\n", text).strip()
+
+        if max_chars > 0 and len(text) > max_chars:
+            text = text[:max_chars] + "\n...[已截断]"
+        return text
+    except Exception:
+        return ""
+
+
+async def _fetch_detail_playwright(url: str, max_chars: int) -> str:
+    """Playwright 无头浏览器渲染抓取详情。"""
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return ""
+
+    try:
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+        page = await browser.new_page(
+            user_agent=random.choice(_USER_AGENTS),
+            locale="zh-CN",
+        )
+        await page.goto(url, timeout=15000, wait_until="domcontentloaded")
+        try:
+            await page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+
+        text = await page.evaluate("""
+            () => {
+                document.querySelectorAll('script, style, nav, header, footer, aside, iframe').forEach(e => e.remove());
+                return document.body ? document.body.innerText : '';
+            }
+        """)
+
+        await browser.close()
+        await pw.stop()
+
+        if not text or len(text.strip()) < 50:
+            return ""
+
+        text = text.strip()
+        title = await page.title() if not page.is_closed() else ""
+        if title:
+            text = f"标题: {title}\n\n{text}"
+
+        if max_chars > 0 and len(text) > max_chars:
+            text = text[:max_chars] + "\n...[已截断]"
+        return text
+    except Exception:
+        return ""
+
+
 async def search_bing_async(
     keywords: list[str],
     max_results: int = 8,
     timeout: int = 30,
+    fetch_detail: bool = True,
+    detail_top_n: int = 3,
+    detail_max_chars: int = 3000,
 ) -> str:
-    """异步 Bing 搜索，支持多关键词并行，返回 JSON 结果字符串。"""
+    """异步 Bing 搜索，支持自动抓取详情页、多关键词并行。"""
     if not keywords:
         return json.dumps({"error": "未提供关键词"}, ensure_ascii=False)
 
@@ -89,7 +212,7 @@ async def search_bing_async(
         if cached:
             return cached
 
-    # 多关键词并行搜索
+    # 多关键词并行
     if len(keywords) > 1:
         tasks = [_search_single(kw, max_results, timeout) for kw in keywords]
         results_list = await asyncio.gather(*tasks, return_exceptions=True)
@@ -102,28 +225,48 @@ async def search_bing_async(
                 data = json.loads(r)
                 for item in data.get("results", []):
                     url = item.get("url", "")
-                    if url not in seen_urls:
+                    if url and url not in seen_urls:
                         seen_urls.add(url)
                         item["rank"] = len(merged) + 1
                         merged.append(item)
             except (json.JSONDecodeError, ValueError):
                 continue
-        result = json.dumps({
+        result_data = {
             "query": " ".join(keywords),
             "total_results": len(merged),
             "results": merged[:max_results * 2],
-        }, ensure_ascii=False, indent=2)
-        return result
+        }
+    else:
+        raw = await _search_single(keywords[0], max_results, timeout)
+        try:
+            result_data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return raw
+        # 缓存成功结果
+        if result_data.get("results"):
+            _cache_set(cache_key, raw)
 
-    result = await _search_single(keywords[0], max_results, timeout)
-    # 缓存成功结果
-    try:
-        data = json.loads(result)
-        if data.get("results"):
-            _cache_set(cache_key, result)
-    except (json.JSONDecodeError, ValueError):
-        pass
-    return result
+    # ── 自动抓取详情页 ──
+    if fetch_detail and result_data.get("results"):
+        detail_urls = []
+        for r in result_data["results"]:
+            url = r.get("url", "")
+            if url and _should_fetch_detail(url) and len(detail_urls) < detail_top_n:
+                detail_urls.append((r, url))
+
+        if detail_urls:
+            tasks = [
+                _fetch_detail(url, detail_max_chars)
+                for _, url in detail_urls
+            ]
+            details = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for (result_item, _), detail in zip(detail_urls, details):
+                if isinstance(detail, Exception) or not detail:
+                    continue
+                result_item["detail_content"] = detail
+
+    return json.dumps(result_data, ensure_ascii=False, indent=2)
 
 
 async def _search_single(
@@ -204,7 +347,6 @@ def _parse_bing_html(html: str, max_results: int) -> list[dict]:
             if not title or not url:
                 continue
 
-            # 摘要
             snippet = ""
             p_tag = li.find("p")
             if p_tag:
@@ -214,7 +356,6 @@ def _parse_bing_html(html: str, max_results: int) -> list[dict]:
                 if caption:
                     snippet = caption.get_text(strip=True)
 
-            # 日期
             date = ""
             if snippet:
                 dm = re.search(r"(\d{4}[-年]\d{1,2}[-月]\d{1,2}日?)", snippet)
@@ -242,7 +383,10 @@ if _ASTRBOT_AVAILABLE:
     @dataclass
     class BingSearchTool(FunctionTool):
         name: str = "web_search"
-        description: str = "搜索互联网获取实时信息。keywords 传搜索关键词列表，支持多个关键词并行搜索。"
+        description: str = (
+            "搜索互联网获取实时信息，并自动抓取前几个结果的详细内容。"
+            "keywords 传搜索关键词列表。"
+        )
         parameters: dict = field(
             default_factory=lambda: {
                 "type": "object",
@@ -250,7 +394,7 @@ if _ASTRBOT_AVAILABLE:
                     "keywords": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "搜索关键词列表，多个关键词会并行搜索并合并结果",
+                        "description": "搜索关键词列表",
                     },
                 },
                 "required": ["keywords"],
@@ -267,6 +411,9 @@ if _ASTRBOT_AVAILABLE:
             result = await search_bing_async(
                 keywords=keywords,
                 timeout=self.search_timeout,
+                fetch_detail=True,
+                detail_top_n=3,
+                detail_max_chars=3000,
             )
             return CallToolResult(
                 content=[TextContent(type="text", text=result)]
