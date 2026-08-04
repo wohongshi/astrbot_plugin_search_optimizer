@@ -29,5 +29,11 @@
     "type": "int",
     "default": 1500,
     "hint": "控制摘要长度。值越大保留信息越多，但 Token 消耗也越多。"
+  },
+  "small_model_answer": {
+    "description": "小模型直接回答（命中缓存时用小模型回答，不消耗主力模型 Token）",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，缓存命中时用预处理模型直接回答用户问题，主力模型完全不参与。适合简单事实性问题。"
   }
 }

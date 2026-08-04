@@ -119,6 +119,7 @@ class SearchOptimizerPlugin(Star):
         self.cache_days = self.config.get("cache_days", 3)
         self.max_cache_entries = self.config.get("max_cache_entries", 200)
         self.max_summary_chars = self.config.get("max_summary_chars", 1500)
+        self.small_model_answer = self.config.get("small_model_answer", False)
 
     # ══════════════════════════════════════════════════════════
     # 缓存系统
@@ -243,6 +244,31 @@ class SearchOptimizerPlugin(Star):
         logger.info(
             f"[搜索优化器] 缓存命中 (累计 {self._cache_hits}): {user_msg[:30]}..."
         )
+
+        # 如果开启小模型直接回答，用预处理模型生成最终答案
+        if self.small_model_answer and self.preprocess_provider_id:
+            answer = await self._small_model_answer(user_msg, cached)
+            if answer:
+                try:
+                    from astrbot.core.agent.message import TextPart
+                    inject_text = (
+                        f"<cached_answer>\n"
+                        f"以下是根据搜索结果生成的回答，直接输出即可：\n\n"
+                        f"{answer}\n"
+                        f"</cached_answer>"
+                    )
+                    if hasattr(req, "extra_user_content_parts"):
+                        req.extra_user_content_parts.append(
+                            TextPart(text=inject_text).mark_as_temp()
+                        )
+                    logger.info(
+                        f"[搜索优化器] 小模型已生成答案 ({len(answer)} 字符)"
+                    )
+                except Exception as e:
+                    logger.warning(f"[搜索优化器] 注入答案失败: {e}")
+            return
+
+        # 普通模式：注入缓存内容，让主力模型组织答案
         try:
             from astrbot.core.agent.message import TextPart
             inject_text = (
@@ -273,6 +299,24 @@ class SearchOptimizerPlugin(Star):
         except Exception:
             pass
         return ""
+
+    async def _small_model_answer(self, user_msg: str, cached: str) -> Optional[str]:
+        """用小模型直接生成最终回答（不经过主力模型）。"""
+        prompt = (
+            f"用户问题：{user_msg}\n\n"
+            f"以下是相关的搜索结果摘要：\n{cached}\n\n"
+            f"请根据以上搜索结果，用简洁的中文回答用户的问题。"
+            f"如果搜索结果中没有相关信息，请说明。"
+        )
+        try:
+            resp = await self.context.llm_generate(
+                chat_provider_id=self.preprocess_provider_id,
+                prompt=prompt,
+            )
+            return resp.completion_text
+        except Exception as e:
+            logger.error(f"[搜索优化器] 小模型回答失败: {e}")
+            return None
 
     # ══════════════════════════════════════════════════════════
     # 钩子：拦截工具返回结果（支持多 URL 并行处理）
@@ -624,6 +668,7 @@ class SearchOptimizerPlugin(Star):
             f"  模式: {'LLM 摘要' if self.preprocess_provider_id else '规则提取'}",
             f"  模型: {model}",
             f"  优化搜索: {'✅' if self.optimize_search else '❌'}",
+            f"  小模型回答: {'✅' if self.small_model_answer else '❌'}",
             f"  缓存: {cache_count}/{self.max_cache_entries} 条 ({self.cache_days}天)",
             f"  摘要上限: {self.max_summary_chars} 字符",
             f"  缓存命中: {self._cache_hits} 次",
