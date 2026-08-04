@@ -2,6 +2,7 @@
 
 import asyncio
 import ipaddress
+import os
 import re
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
@@ -49,8 +50,26 @@ async def _get_session() -> aiohttp.ClientSession:
         return _session
 
 
+# 系统 Chromium 路径（apt install chromium）
+_SYSTEM_CHROMIUM_PATHS = [
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+]
+
+
+def _find_system_chromium() -> str | None:
+    """查找系统安装的 Chromium/Chrome。"""
+    import shutil
+    for p in _SYSTEM_CHROMIUM_PATHS:
+        if shutil.which(p) or os.path.isfile(p):
+            return p
+    return None
+
+
 async def _get_browser():
-    """获取共享的 Playwright 浏览器实例。"""
+    """获取共享的 Playwright 浏览器实例（优先用系统 Chromium）。"""
     global _browser
     if not _PLAYWRIGHT_AVAILABLE:
         return None
@@ -58,15 +77,20 @@ async def _get_browser():
         if _browser is None or not _browser.is_connected():
             try:
                 pw = await async_playwright().start()
-                _browser = await pw.chromium.launch(
-                    headless=True,
-                    args=[
+                chromium_path = _find_system_chromium()
+                launch_args = {
+                    "headless": True,
+                    "args": [
                         "--no-sandbox",
                         "--disable-dev-shm-usage",
                         "--disable-gpu",
                         "--disable-extensions",
                     ],
-                )
+                }
+                if chromium_path:
+                    launch_args["executable_path"] = chromium_path
+                    logger.info(f"[web_fetch] 使用系统 Chromium: {chromium_path}")
+                _browser = await pw.chromium.launch(**launch_args)
             except Exception as e:
                 logger.warning(f"[web_fetch] Playwright 启动失败: {e}")
                 _browser = None

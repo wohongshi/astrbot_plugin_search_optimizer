@@ -144,6 +144,16 @@ async def _fetch_detail_aiohttp(url: str, max_chars: int) -> str:
         return ""
 
 
+def _find_system_chromium() -> str | None:
+    """查找系统 Chromium。"""
+    import shutil, os
+    for p in ["/usr/bin/chromium", "/usr/bin/chromium-browser",
+              "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"]:
+        if shutil.which(p) or os.path.isfile(p):
+            return p
+    return None
+
+
 async def _fetch_detail_playwright(url: str, max_chars: int) -> str:
     """Playwright 无头浏览器渲染抓取详情。"""
     try:
@@ -153,10 +163,14 @@ async def _fetch_detail_playwright(url: str, max_chars: int) -> str:
 
     try:
         pw = await async_playwright().start()
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-        )
+        launch_args = {
+            "headless": True,
+            "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        }
+        chromium_path = _find_system_chromium()
+        if chromium_path:
+            launch_args["executable_path"] = chromium_path
+        browser = await pw.chromium.launch(**launch_args)
         page = await browser.new_page(
             user_agent=random.choice(_USER_AGENTS),
             locale="zh-CN",
