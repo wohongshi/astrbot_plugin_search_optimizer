@@ -601,6 +601,35 @@ class SearchOptimizerPlugin(Star):
         text = re.sub(r'\[内容已截断.*?\]', '', text)
         text = re.sub(r'标题:\s*\n', '', text)
         text = re.sub(r'===\s*===\s*\n?', '', text)
+
+        # 搜索页面噪声：其他人还搜了、相关搜索、热搜榜等（删除该行及之后所有内容）
+        for pat in [
+            r'其他人还搜了[：:].*$',
+            r'相关搜索[：:].*$',
+            r'热搜榜[：:].*$',
+            r'猜您关注.*$',
+            r'查看更多推荐.*$',
+            r'换一换.*$',
+        ]:
+            text = re.sub(pat, '', text, flags=re.DOTALL)
+
+        # 页脚噪声：关于我们、反馈、隐私、版权等导航行
+        footer_pats = [
+            r'(?:关于我们|加入我们|关于本站|联系方式)[^\n]*(?:官网|相关信息|我们)[^\n]*',
+            r'(?:反馈|隐私管理|违法举报|产品论坛|网站收录|使用帮助|推广合作|站长平台)\s*[|｜]\s*',
+            r'(?:Copyright|©|版权).*?\n',
+            r'(?:All Rights Reserved|保留所有权利).*?\n',
+            r'(?:ICP备|备案号|公安备).*?\n',
+            r'(?:关于我们|加入我们|反馈|隐私|举报|论坛|收录|帮助|推广|站长)[^\n]*',
+            r'查看更多的*推荐.*',
+            r'在搜索里推广您的产品.*',
+        ]
+        for p in footer_pats:
+            text = re.sub(p, '', text, flags=re.IGNORECASE)
+
+        # 来源链接（旧版可能残留）
+        text = re.sub(r'来源:\s*\n(?:\s*-\s*https?://[^\n]+\n?)+', '', text)
+
         text = re.sub(r'\n{3,}', '\n\n', text)
         text = text.strip()
         return text if len(text) >= 50 else ""
