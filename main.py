@@ -33,10 +33,34 @@ _SEARCH_TOOL_PATTERNS = (
     "tavily", "brave_search", "duckduckgo",
 )
 
+# shell 输出中出现这些域名时，视为搜索结果
+_SEARCH_DOMAIN_HINTS = (
+    "so.com/s", "baidu.com/s", "bing.com/search", "google.com/search",
+    "sogou.com/web", "yandex.com/search", "duckduckgo.com",
+    "search.yahoo.com", "bilibili.com/search", "zhihu.com/search",
+)
+
 
 def _is_search_tool(name: str) -> bool:
     n = name.lower()
     return any(p in n for p in _SEARCH_TOOL_PATTERNS)
+
+
+def _is_shell_search(tool_name: str, tool_args: dict | None, text: str) -> bool:
+    """判断 shell 工具的输出是否为网页搜索结果。"""
+    if "execute_shell" not in tool_name.lower() and "shell" not in tool_name.lower():
+        return False
+    # 检查命令参数中是否包含搜索 URL
+    cmd = ""
+    if tool_args:
+        cmd = str(tool_args.get("command", "")).lower()
+    if any(d in cmd for d in _SEARCH_DOMAIN_HINTS):
+        return True
+    # 检查输出内容是否包含搜索结果特征（大量 URL + 短文本片段）
+    url_count = len(re.findall(r'https?://', text))
+    if url_count >= 3 and len(text) > 2000:
+        return True
+    return False
 
 
 def _is_json_search_result(text: str) -> bool:
@@ -281,6 +305,7 @@ class SearchOptimizerPlugin(Star):
                     or _is_json_search_result(text)
                     or self._has_many_urls(text)
                     or len(text) > 5000
+                    or any(d in text.lower() for d in _SEARCH_DOMAIN_HINTS)
                 )
                 if not is_search:
                     continue
@@ -427,7 +452,15 @@ class SearchOptimizerPlugin(Star):
         tool_args: dict | None, tool_result,
     ):
         tool_name = getattr(tool, "name", "")
-        if not _is_search_tool(tool_name):
+        # 检查是否为已知搜索工具，或 shell 执行了搜索命令
+        is_known_search = _is_search_tool(tool_name)
+        is_shell_search = False
+        if not is_known_search:
+            # 对 shell 工具，先提取输出再判断
+            if tool_result and hasattr(tool_result, "content"):
+                combined = self._extract_text(tool_result.content)
+                is_shell_search = _is_shell_search(tool_name, tool_args, combined)
+        if not is_known_search and not is_shell_search:
             return
         try:
             await self._process_tool_result(
@@ -510,12 +543,20 @@ class SearchOptimizerPlugin(Star):
     def _extract_search_query(self, tool_args: dict | None) -> str:
         if not tool_args:
             return ""
+        # 标准工具参数
         for key in ("keywords", "query", "q", "keyword"):
             val = tool_args.get(key)
             if val:
                 if isinstance(val, list):
                     return " ".join(str(v) for v in val)
                 return str(val)
+        # shell 命令中提取搜索关键词
+        cmd = tool_args.get("command", "")
+        if cmd:
+            m = re.search(r'[?&]q=([^&"\s]+)', cmd)
+            if m:
+                from urllib.parse import unquote_plus
+                return unquote_plus(m.group(1))
         return ""
 
     def _extract_urls_from_args(self, tool_args: dict | None) -> list[str]:
