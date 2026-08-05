@@ -1,5 +1,5 @@
 """
-AstrBot 搜索结果优化器 v7
+AstrBot 搜索结果优化器 v6.1.0
 功能：
 1. 内置 web_search + web_fetch 工具（自包含，无需额外插件）
 2. 两阶段压缩：规则提取 → 小模型精简（可选）
@@ -31,7 +31,6 @@ _SEARCH_TOOL_PATTERNS = (
     "web_search", "web_fetch", "web_search_tool", "web_fetch_tool",
     "bing_search", "google_search",
     "tavily", "brave_search", "duckduckgo",
-    "astrbot_execute_shell",
 )
 
 
@@ -193,13 +192,14 @@ class SearchOptimizerPlugin(Star):
         key = _normalize_query(query)
         entry = self._cache.get(key)
         if not entry:
-            q_words = set(key.split())
+            q_chars = set(key.replace(' ', ''))
             for cached_key, cached_entry in self._cache.items():
-                c_words = set(cached_key.split())
-                if not q_words or not c_words:
+                c_chars = set(cached_key.replace(' ', ''))
+                if not q_chars or not c_chars:
                     continue
-                overlap = len(q_words & c_words)
-                if overlap / min(len(q_words), len(c_words)) > 0.6:
+                overlap = len(q_chars & c_chars)
+                union = len(q_chars | c_chars)
+                if union > 0 and overlap / union > 0.75:
                     entry = cached_entry
                     key = cached_key
                     break
@@ -260,8 +260,15 @@ class SearchOptimizerPlugin(Star):
                 role = getattr(msg, 'role', None)
                 if role not in ('tool', 'function'):
                     continue
-                tool_name = getattr(msg, 'name', '') or ''
+                # 跳过已被 on_llm_tool_respond 处理过的消息
+                if getattr(msg, '_search_opt_processed', False):
+                    continue
                 content = getattr(msg, 'content', None)
+                # 检查内容项是否已被标记
+                if isinstance(content, list):
+                    if any(getattr(item, '_search_opt_processed', False) for item in content):
+                        continue
+                tool_name = getattr(msg, 'name', '') or ''
                 text = self._extract_text(content)
                 if not text or len(text) < 2000:
                     continue
@@ -425,6 +432,11 @@ class SearchOptimizerPlugin(Star):
             await self._process_tool_result(
                 event, tool_name, tool_args, tool_result
             )
+            # 标记 tool_result 内容，防止 on_agent_done 重复处理
+            if tool_result and hasattr(tool_result, "content"):
+                for item in tool_result.content:
+                    if hasattr(item, "text") and "<compressed>" in (item.text or ""):
+                        setattr(item, "_search_opt_processed", True)
         except Exception as e:
             logger.error(f"[搜索优化器] 处理 {tool_name} 失败: {e}")
 

@@ -57,12 +57,18 @@ AstrBot 插件 — 内置网页搜索和抓取工具 + 压缩搜索结果 + 缓�
 - 重新组合关键词重搜
 - 直到找到相关结果或所有组合用尽
 
+## 🧩 技能（Skills）
+
+插件自带 `skills/web-search-helper/` 目录，安装后 AstrBot 会自动将 `web_search` 和 `web_fetch` 注册为可用工具。在 WebUI 的 Skills 页面可查看。
+
 ## 📦 安装
 
 ### 依赖
 
 ```bash
-pip install aiohttp beautifulsoup4 trafilatura DrissionPage
+pip install aiohttp beautifulsoup4 trafilatura
+# DrissionPage 可选：用于 JS 渲染页面的兜底抓取
+# pip install DrissionPage
 ```
 
 ### 系统要求

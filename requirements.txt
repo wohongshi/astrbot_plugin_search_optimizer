@@ -1,4 +1,5 @@
 aiohttp>=3.9
 beautifulsoup4>=4.12
 trafilatura>=1.8
-DrissionPage>=4.0
+# DrissionPage is optional: used as fallback for JS-rendered pages
+# Install manually if needed: pip install DrissionPage>=4.0
