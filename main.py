@@ -150,6 +150,18 @@ class SearchOptimizerPlugin(Star):
         else:
             logger.info(f"[搜索优化器] 预处理模型: {self.preprocess_provider_id}")
 
+        # 注册插件 Page 后端 API
+        try:
+            self.context.register_web_api(
+                "/astrbot_plugin_search_optimizer/test-model",
+                self._api_test_model,
+                ["POST"],
+                "小模型压缩测试",
+            )
+            logger.info("[搜索优化器] Page API 注册成功: /test-model")
+        except Exception as e:
+            logger.warning(f"[搜索优化器] Page API 注册失败: {e}")
+
     def _load_config(self):
         self.preprocess_provider_id = self.config.get("preprocess_provider_id", "")
         self.optimize_search = self.config.get("optimize_search", False)
@@ -926,6 +938,60 @@ class SearchOptimizerPlugin(Star):
             if p["id"] == pid:
                 return p.get("model", pid)
         return None
+
+    # ══════════════════════════════════════════════════════════
+    # 插件 Page API
+    # ══════════════════════════════════════════════════════════
+
+    async def _api_test_model(self):
+        from astrbot.api.web import error_response, json_response, request
+
+        payload = await request.json(default={})
+        content = payload.get("content", "").strip()
+        if not content:
+            return error_response("内容不能为空", status_code=400)
+
+        original_chars = len(content)
+
+        # 第一阶段：规则提取
+        source_urls = self._extract_urls(content)
+        cleaned = self._strip_noise(content)
+        if not cleaned:
+            cleaned = content
+        rule_result = self._rule_extract("test", {}, cleaned, source_urls)
+        if not rule_result:
+            rule_result = cleaned
+
+        mode = "规则"
+        model_name = ""
+        compressed = rule_result
+
+        # 第二阶段：小模型精简
+        if self.preprocess_provider_id:
+            llm_result = await self._llm_preprocess("test", {}, rule_result, source_urls)
+            if llm_result and len(llm_result) < len(rule_result):
+                compressed = llm_result
+                mode = "规则+LLM"
+            try:
+                model_name = await self._get_provider_display_name(
+                    self.preprocess_provider_id
+                ) or self.preprocess_provider_id
+            except Exception:
+                model_name = self.preprocess_provider_id
+
+        compressed_chars = len(compressed)
+        ratio = round((1 - compressed_chars / original_chars) * 100, 1) if original_chars > 0 else 0
+        tokens_saved = max(0, round((original_chars - compressed_chars) / 1.5))
+
+        return json_response({
+            "compressed": compressed,
+            "original_chars": original_chars,
+            "compressed_chars": compressed_chars,
+            "compression_ratio": ratio,
+            "tokens_saved": tokens_saved,
+            "mode": mode,
+            "model": model_name,
+        })
 
     # ══════════════════════════════════════════════════════════
     # 生命周期

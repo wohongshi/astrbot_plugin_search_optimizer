@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>小模型测试</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg, #f5f5f5); color: var(--text, #333); padding: 20px; }
+@media (prefers-color-scheme: dark) { body { --bg: #1a1a2e; --text: #e0e0e0; --card: #16213e; --border: #2a2a4a; --accent: #4cc9f0; --muted: #888; } }
+@media (prefers-color-scheme: light) { body { --bg: #f5f5f5; --text: #333; --card: #fff; --border: #e0e0e0; --accent: #2196f3; --muted: #666; } }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+h1 { font-size: 20px; margin-bottom: 4px; }
+.subtitle { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; color: var(--muted); }
+textarea { width: 100%; height: 200px; padding: 12px; border: 1px solid var(--border); border-radius: 8px; font-family: 'Courier New', monospace; font-size: 13px; line-height: 1.5; resize: vertical; background: var(--bg); color: var(--text); }
+.btn { display: inline-flex; align-items: center; gap: 8px; padding: 10px 24px; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+.btn-primary { background: var(--accent); color: #fff; }
+.btn-primary:hover { opacity: 0.9; transform: translateY(-1px); }
+.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+.btn-secondary { background: var(--border); color: var(--text); }
+.btn-row { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+.spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 0.6s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.result-section { margin-top: 16px; }
+.result-box { padding: 14px; border-radius: 8px; background: var(--bg); border: 1px solid var(--border); font-size: 13px; line-height: 1.6; white-space: pre-wrap; word-break: break-all; max-height: 400px; overflow-y: auto; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-top: 12px; }
+.stat-item { text-align: center; padding: 14px; border-radius: 8px; background: var(--bg); border: 1px solid var(--border); }
+.stat-value { font-size: 24px; font-weight: 700; color: var(--accent); }
+.stat-label { font-size: 12px; color: var(--muted); margin-top: 4px; }
+.tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+.tag-ok { background: #d4edda; color: #155724; }
+.tag-warn { background: #fff3cd; color: #856404; }
+.tag-err { background: #f8d7da; color: #721c24; }
+.error { color: #dc3545; padding: 12px; border-radius: 8px; background: #f8d7da; margin-top: 12px; font-size: 13px; }
+.hidden { display: none; }
+.char-bar { height: 8px; border-radius: 4px; margin-top: 8px; overflow: hidden; background: var(--border); }
+.char-bar-fill { height: 100%; border-radius: 4px; transition: width 0.5s ease; }
+</style>
+</head>
+<body>
+
+<h1>🧪 小模型压缩测试</h1>
+<p class="subtitle">模拟搜索结果压缩，查看预处理模型效果和 Token 节省量</p>
+
+<div class="card">
+  <label>模拟搜索结果（可编辑）</label>
+  <textarea id="testData"></textarea>
+  <div class="btn-row">
+    <button class="btn btn-secondary" onclick="resetData()">重置默认数据</button>
+    <button class="btn btn-primary" id="btnTest" onclick="runTest()">
+      <span id="btnText">🚀 测试压缩</span>
+    </button>
+  </div>
+</div>
+
+<div id="resultSection" class="card result-section hidden">
+  <label>压缩结果</label>
+  <div class="result-box" id="resultBox"></div>
+</div>
+
+<div id="statsSection" class="card hidden">
+  <label>📊 压缩统计</label>
+  <div class="stats">
+    <div class="stat-item">
+      <div class="stat-value" id="statOriginal">-</div>
+      <div class="stat-label">原始字符</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-value" id="statCompressed">-</div>
+      <div class="stat-label">压缩后字符</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-value" id="statRatio">-</div>
+      <div class="stat-label">压缩率</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-value" id="statSaved">-</div>
+      <div class="stat-label">节省 Token</div>
+    </div>
+  </div>
+  <div class="char-bar">
+    <div class="char-bar-fill" id="charBar" style="width:0%;background:#4cc9f0;"></div>
+  </div>
+  <div style="margin-top:10px;font-size:12px;color:var(--muted);">
+    <span id="modeTag"></span>
+    <span id="modelTag" style="margin-left:8px;"></span>
+  </div>
+</div>
+
+<div id="errorBox" class="error hidden"></div>
+
+<script>
+const DEFAULT_DATA = `=== https://www.9game.cn/news/8457365.html ===
+标题: 《崩坏3》繁星 格蕾修 人物介绍
+
+格蕾修是《崩坏3》逐火十三英桀之一，代号「繁星」。她是一位以画笔为武器的少女，不爱言语，所思所想皆在画笔之下；不闻世事，心之所向尽在色彩之中。一幅画卷，织成了格蕾修与她的世界。
+
+格蕾修是逐火十三英桀中最年轻的成员，被其他成员们当作妹妹一样疼爱。她的画笔拥有将想象化为现实的力量，可以召唤出画中的生物来协助战斗。在战斗中，格蕾修通常站在后方，用画笔创造出各种奇幻的场景和生物来支援队友。
+
+★逐火十三英桀档案丨「繁星」格蕾修 ★
+- 称号：繁星
+- 武器：画笔
+- 能力：将想象力化为现实，召唤画中生物
+- 性格：沉默寡言，天真烂漫
+- 所属：逐火十三英桀
+
+Copyright © 2022-2026 九游手机游戏 版权所有
+ICP备粤B2-20090059-1号 | 粤网文[2022]3026-236号
+
+=== https://www.miyoushe.com/bh3/article/128.html ===
+标题: 格蕾修-崩坏3 社区-米游社
+
+每日崩坏每日一水 格蕾修。米游社- 崩坏3 社区是米哈游miHoYo旗下崩坏3游戏玩家社区，这里集合了玩家互动、官方资讯、福利趣闻和同人作品。
+
+格蕾修（Griseo），崩坏3中的SP角色，逐火十三英桀之一。她是一名辅助型角色，拥有极高的泛用性。格蕾修的技能机制围绕「色彩」展开，通过不同颜色的画笔攻击为队伍提供增益效果。
+
+角色评价：
+- SP版本泛用性极高，是目前最强辅助之一
+- 适配多种队伍组合
+- 操作简单，适合新手使用
+- 人设可爱，深受玩家喜爱
+
+关于我们加入我们崩坏3官网米哈游官网相关信息.
+反馈 | 隐私管理 | 违法举报 | 产品论坛 | 网站收录 | 使用帮助
+
+=== https://ai.so.com/ ===
+崩坏3格蕾修 角色介绍
+
+格蕾修是《崩坏3》逐火十三英桀之一，代号「繁星」。她以画笔为武器，不爱言语，将所思所想融入绘画创作中。
+
+综合评价：格蕾修SP版本是泛用性极高的辅助角色，拥有出色的增伤能力和护盾效果。在当前版本中，格蕾修几乎可以适配所有物理和元素队伍，是抽到必练的角色之一。
+
+装备推荐：
+- 武器：繁星之绘（专属武器）
+- 圣痕：繁星套（上中下）
+- 替代方案：特斯拉·乐队上 + 爱因斯坦·乐队中 + 牛顿下
+
+其他人还搜了：崩坏三格蕾修桃文 | 崩坏3格蕾修 | 崩坏三格蕾修位居第几位 | 崩坏三格蕾修值得抽吗 | 崩坏3rb雨师泽格蕾修的祈求 | 崩坏三格蕾修本子h | 崩坏三格蕾修头像
+
+相关搜索：崩坏3 格蕾修 | 崩坏三格蕾修桃文 | 崩坏三格蕾修值得抽吗 | 崩坏三格蕾修位居第几位 | 崩坏三格蕾修本子h | 崩坏三幽兰黛尔的堕落 | 崩坏3大格蕾修图片 | 崩坏3格蕾修圣痕
+
+热搜榜：1 短剧演员日薪四万 2 应休尽休！河南带薪休假新政 3 铸锅招学徒 月薪1.5万上2休1 ...`;
+
+document.getElementById('testData').value = DEFAULT_DATA;
+
+function resetData() {
+  document.getElementById('testData').value = DEFAULT_DATA;
+}
+
+async function runTest() {
+  const btn = document.getElementById('btnTest');
+  const btnText = document.getElementById('btnText');
+  const testData = document.getElementById('testData').value.trim();
+
+  if (!testData) { showError('请输入测试数据'); return; }
+
+  btn.disabled = true;
+  btnText.innerHTML = '<span class="spinner"></span> 正在压缩...';
+  hideError();
+  hide('resultSection');
+  hide('statsSection');
+
+  try {
+    const bridge = window.AstrBotPluginPage;
+    await bridge.ready();
+
+    const result = await bridge.apiPost('test-model', { content: testData });
+
+    if (result.status === 'error') {
+      showError(result.message || '请求失败');
+      return;
+    }
+
+    const data = result;
+
+    // 显示结果
+    document.getElementById('resultBox').textContent = data.compressed || '(空)';
+    show('resultSection');
+
+    // 显示统计
+    const original = data.original_chars || testData.length;
+    const compressed = data.compressed_chars || 0;
+    const ratio = data.compression_ratio || (original > 0 ? ((1 - compressed / original) * 100).toFixed(1) : 0);
+    const savedTokens = data.tokens_saved || Math.round((original - compressed) / 1.5);
+
+    document.getElementById('statOriginal').textContent = original.toLocaleString();
+    document.getElementById('statCompressed').textContent = compressed.toLocaleString();
+    document.getElementById('statRatio').textContent = ratio + '%';
+    document.getElementById('statSaved').textContent = '~' + savedTokens.toLocaleString();
+
+    const barWidth = original > 0 ? (compressed / original * 100) : 0;
+    const bar = document.getElementById('charBar');
+    bar.style.width = barWidth + '%';
+    bar.style.background = barWidth < 30 ? '#28a745' : barWidth < 60 ? '#ffc107' : '#dc3545';
+
+    const mode = data.mode || '规则';
+    document.getElementById('modeTag').innerHTML = '<span class="tag tag-ok">' + mode + '</span>';
+    document.getElementById('modelTag').textContent = data.model ? '模型: ' + data.model : '';
+
+    show('statsSection');
+
+  } catch (e) {
+    showError('请求失败: ' + (e.message || e));
+  } finally {
+    btn.disabled = false;
+    btnText.textContent = '🚀 测试压缩';
+  }
+}
+
+function show(id) { document.getElementById(id).classList.remove('hidden'); }
+function hide(id) { document.getElementById(id).classList.add('hidden'); }
+function showError(msg) { const el = document.getElementById('errorBox'); el.textContent = '❌ ' + msg; el.classList.remove('hidden'); }
+function hideError() { document.getElementById('errorBox').classList.add('hidden'); }
+</script>
+</body>
+</html>
