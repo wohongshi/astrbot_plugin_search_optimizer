@@ -41,5 +41,12 @@
     "type": "int",
     "default": 30,
     "hint": "单次搜索或抓取的超时时间。网络环境差可适当增大。"
+  },
+  "cache_similarity_threshold": {
+    "description": "缓存模糊匹配相似度阈值",
+    "type": "float",
+    "default": 0.75,
+    "options": [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8],
+    "hint": "查询与缓存的字符 Jaccard 相似度超过此值时视为命中。值越高越严格，越低越宽松。建议 0.65-0.75。"
   }
 }

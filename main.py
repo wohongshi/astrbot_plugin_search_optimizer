@@ -133,6 +133,7 @@ class SearchOptimizerPlugin(Star):
         self.max_cache_entries = self.config.get("max_cache_entries", 200)
         self.max_summary_chars = self.config.get("max_summary_chars", 1500)
         self.small_model_answer = self.config.get("small_model_answer", False)
+        self.cache_similarity_threshold = self.config.get("cache_similarity_threshold", 0.75)
 
     # ══════════════════════════════════════════════════════════
     # 缓存系统
@@ -199,7 +200,7 @@ class SearchOptimizerPlugin(Star):
                     continue
                 overlap = len(q_chars & c_chars)
                 union = len(q_chars | c_chars)
-                if union > 0 and overlap / union > 0.75:
+                if union > 0 and overlap / union >= self.cache_similarity_threshold:
                     entry = cached_entry
                     key = cached_key
                     break
