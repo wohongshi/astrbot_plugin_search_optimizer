@@ -622,8 +622,6 @@ class SearchOptimizerPlugin(Star):
             result = resp.completion_text
             if not result:
                 return None
-            if source_urls:
-                result += "\n\n来源:\n" + "\n".join(f"- {u}" for u in source_urls[:5])
             return result
         except Exception as e:
             logger.error(f"[搜索优化器] LLM 压缩失败: {e}")
@@ -648,8 +646,6 @@ class SearchOptimizerPlugin(Star):
             result = self._extract_json_search(s)
         else:
             result = self._extract_web_text(s)
-        if source_urls and result:
-            result += "\n\n来源:\n" + "\n".join(f"- {u}" for u in source_urls[:5])
         return result
 
     def _extract_json_search(self, text):
